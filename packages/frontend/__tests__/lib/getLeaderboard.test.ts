@@ -42,6 +42,83 @@ const mockState = vi.hoisted(() => {
   );
 
   const db = {
+    execute: vi.fn((query: { strings?: string[]; values?: unknown[] }) => {
+      const queryText = query.strings?.join("") ?? "";
+      const queryValues = (values: unknown[]): string[] => values.flatMap((value) => {
+        if (typeof value === "string") {
+          return [value];
+        }
+        if (
+          typeof value === "object"
+          && value !== null
+          && "values" in value
+          && Array.isArray(value.values)
+        ) {
+          return queryValues(value.values);
+        }
+        return [];
+      });
+      const values = queryValues(query.values ?? []);
+      const aggregated = Array.from(
+        periodRows.reduce((usersById, row) => {
+          const userId = String(row.userId);
+          const existing = usersById.get(userId);
+          if (existing) {
+            existing.totalTokens += Number(row.tokens) || 0;
+            existing.totalCost += Number(row.cost) || 0;
+          } else {
+            usersById.set(userId, {
+              userId,
+              username: String(row.username),
+              displayName: (row.displayName as string | null) ?? null,
+              avatarUrl: (row.avatarUrl as string | null) ?? null,
+              totalTokens: Number(row.tokens) || 0,
+              totalCost: Number(row.cost) || 0,
+            });
+          }
+          return usersById;
+        }, new Map<string, {
+          userId: string;
+          username: string;
+          displayName: string | null;
+          avatarUrl: string | null;
+          totalTokens: number;
+          totalCost: number;
+        }>()).values()
+      ).sort((left, right) =>
+        right.totalTokens - left.totalTokens
+        || right.totalCost - left.totalCost
+        || left.username.localeCompare(right.username)
+      ).map((user, index) => ({ ...user, rank: index + 1 }));
+
+      if (!queryText.includes("json_agg")) {
+        const username = values.find((value) =>
+          !/^\d{4}-\d{2}-\d{2}$/.test(value)
+        );
+        return Promise.resolve(aggregated.filter((user) =>
+          user.username.toLowerCase() === String(username).toLowerCase()
+        ));
+      }
+
+      const searchPattern = values.find((value) =>
+        value.startsWith("%") && value.endsWith("%")
+      );
+      const search = searchPattern ? String(searchPattern).slice(1, -1).toLowerCase() : "";
+      const users = search
+        ? aggregated.filter((user) =>
+            user.username.toLowerCase().includes(search)
+            || user.displayName?.toLowerCase().includes(search)
+          )
+        : aggregated;
+
+      return Promise.resolve([{
+        users,
+        totalUsers: users.length,
+        totalTokens: aggregated.reduce((sum, user) => sum + user.totalTokens, 0),
+        totalCost: aggregated.reduce((sum, user) => sum + user.totalCost, 0),
+        uniqueUsers: aggregated.length,
+      }]);
+    }),
     select: vi.fn(() => {
       const builder = {
         from: vi.fn((table: unknown) => {
@@ -74,6 +151,7 @@ const mockState = vi.hoisted(() => {
       periodRows.length = 0;
       fromCalls.length = 0;
       db.select.mockClear();
+      db.execute.mockClear();
       eq.mockClear();
       desc.mockClear();
       and.mockClear();
@@ -132,11 +210,16 @@ type ModuleExports = typeof import("../../src/lib/leaderboard/getLeaderboard");
 let getLeaderboardData: ModuleExports["getLeaderboardData"];
 let getUserRank: ModuleExports["getUserRank"];
 
-function selectedKeys(callIndex: number): string[] {
-  const calls = mockState.db.select.mock.calls as unknown as Array<
-    [Record<string, unknown> | undefined]
-  >;
-  return Object.keys(calls[callIndex]?.[0] ?? {});
+function serializeSqlCalls(): string[] {
+  return mockState.sql.mock.calls.map((call) => {
+    const [strings, ...values] = call as [TemplateStringsArray, ...unknown[]];
+    const textParts = Array.from(strings);
+
+    return textParts.reduce((text, part, index) => {
+      const nextValue = index < values.length ? String(values[index]) : "";
+      return `${text}${part}${nextValue}`;
+    }, "");
+  });
 }
 
 beforeAll(async () => {
@@ -188,15 +271,10 @@ describe("period leaderboard data", () => {
 
     const leaderboard = await getLeaderboardData("week", 1, 50, "tokens");
 
-    expect(mockState.fromCalls[0]).toBe(mockState.tables.dailyBreakdown);
-    expect(mockState.gte).toHaveBeenCalledWith(
-      mockState.tables.dailyBreakdown.date,
-      "2026-03-01"
-    );
-    expect(mockState.lte).toHaveBeenCalledWith(
-      mockState.tables.dailyBreakdown.date,
-      "2026-03-07"
-    );
+    const sqlTexts = serializeSqlCalls();
+    expect(sqlTexts.some((text) => text.includes("FROM daily_breakdown"))).toBe(true);
+    expect(sqlTexts.some((text) => text.includes("2026-03-01") && text.includes("2026-03-07"))).toBe(true);
+    expect(sqlTexts.some((text) => text.includes("ROW_NUMBER() OVER"))).toBe(true);
     expect(leaderboard.users).toHaveLength(2);
     expect(leaderboard.users[0]).toMatchObject({
       rank: 1,
@@ -224,14 +302,6 @@ describe("period leaderboard data", () => {
       totalCost: 12.5,
       uniqueUsers: 2,
     });
-    expect(selectedKeys(0)).toEqual([
-      "userId",
-      "username",
-      "displayName",
-      "avatarUrl",
-      "tokens",
-      "cost",
-    ]);
   });
 
   it("uses the current month for the month leaderboard range", async () => {
@@ -241,15 +311,8 @@ describe("period leaderboard data", () => {
 
     const leaderboard = await getLeaderboardData("month", 1, 50, "tokens");
 
-    expect(mockState.fromCalls[0]).toBe(mockState.tables.dailyBreakdown);
-    expect(mockState.gte).toHaveBeenCalledWith(
-      mockState.tables.dailyBreakdown.date,
-      "2026-03-01"
-    );
-    expect(mockState.lte).toHaveBeenCalledWith(
-      mockState.tables.dailyBreakdown.date,
-      "2026-03-07"
-    );
+    const sqlTexts = serializeSqlCalls();
+    expect(sqlTexts.some((text) => text.includes("2026-03-01") && text.includes("2026-03-07"))).toBe(true);
     expect(leaderboard.users[1]).toMatchObject({
       username: "alice",
       totalTokens: 250,
@@ -291,7 +354,6 @@ describe("period leaderboard data", () => {
 
     const rank = await getUserRank("alice", "week", "tokens");
 
-    expect(mockState.fromCalls[0]).toBe(mockState.tables.dailyBreakdown);
     expect(rank).toMatchObject({
       rank: 2,
       username: "alice",

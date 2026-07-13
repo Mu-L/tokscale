@@ -44,6 +44,28 @@ const mockState = vi.hoisted(() => {
   );
 
   const db = {
+    execute: vi.fn(() => {
+      const result = awaitedResults.shift() ?? [];
+
+      if (
+        Array.isArray(result)
+        && result.length > 0
+        && typeof result[0] === "object"
+        && result[0] !== null
+        && "rank" in result[0]
+      ) {
+        const stats = awaitedResults.shift() as Array<Record<string, unknown>> | undefined;
+        return Promise.resolve([{
+          users: result,
+          totalUsers: Number(stats?.[0]?.uniqueUsers) || result.length,
+          totalTokens: Number(stats?.[0]?.totalTokens) || 0,
+          totalCost: Number(stats?.[0]?.totalCost) || 0,
+          uniqueUsers: Number(stats?.[0]?.uniqueUsers) || result.length,
+        }]);
+      }
+
+      return Promise.resolve(result);
+    }),
     select: vi.fn(() => {
       const builder = {
         from: vi.fn(() => builder),
@@ -79,6 +101,7 @@ const mockState = vi.hoisted(() => {
       awaitedResults.length = 0;
       limitCalls.length = 0;
       db.select.mockClear();
+      db.execute.mockClear();
       eq.mockClear();
       desc.mockClear();
       and.mockClear();
@@ -194,24 +217,33 @@ describe("all-time leaderboard queries", () => {
   });
 
   it("counts distinct users for all-time pagination and global stats", async () => {
-    mockState.pushAwaitedResult([]);
-    mockState.pushAwaitedResult([{ totalTokens: 0, totalCost: 0, uniqueUsers: 2 }]);
+    mockState.pushAwaitedResult([{
+      users: [],
+      totalUsers: 2,
+      totalTokens: 0,
+      totalCost: 0,
+      uniqueUsers: 2,
+    }]);
 
     const list = await getLeaderboardData("all", 1, 50, "tokens");
     expect(list.pagination.totalUsers).toBe(2);
     expect(serializeSqlCalls().some((text) =>
-      text.includes("COUNT(DISTINCT submissions.userId)")
+      text.includes("COUNT(*) OVER () AS unique_users_all")
     )).toBe(true);
 
     mockState.reset();
-    mockState.pushAwaitedResult([]);
-    mockState.pushAwaitedResult([{ count: 0 }]);
-    mockState.pushAwaitedResult([{ totalTokens: 0, totalCost: 0, uniqueUsers: 2 }]);
+    mockState.pushAwaitedResult([{
+      users: [],
+      totalUsers: 0,
+      totalTokens: 0,
+      totalCost: 0,
+      uniqueUsers: 2,
+    }]);
 
     const search = await getLeaderboardData("all", 1, 50, "tokens", "ali");
     expect(search.stats.uniqueUsers).toBe(2);
     expect(serializeSqlCalls().some((text) =>
-      text.includes("COUNT(DISTINCT submissions.userId)")
+      text.includes("COUNT(*) OVER () AS filtered_users")
     )).toBe(true);
   });
 
@@ -320,17 +352,16 @@ describe("all-time leaderboard queries", () => {
   it("selects and returns only fields consumed by leaderboard surfaces", async () => {
     mockState.pushAwaitedResult([
       {
-        rank: 1,
-        userId: "user-alice",
-        username: "alice",
-        displayName: "Alice",
-        avatarUrl: null,
-        totalTokens: 3000,
-        totalCost: 30,
-      },
-    ]);
-    mockState.pushAwaitedResult([
-      {
+        users: [{
+          rank: 1,
+          userId: "user-alice",
+          username: "alice",
+          displayName: "Alice",
+          avatarUrl: null,
+          totalTokens: 3000,
+          totalCost: 30,
+        }],
+        totalUsers: 1,
         totalTokens: 3000,
         totalCost: 30,
         uniqueUsers: 1,
@@ -338,20 +369,12 @@ describe("all-time leaderboard queries", () => {
     ]);
 
     const leaderboard = await getLeaderboardData("all", 1, 50, "tokens");
-    expect(selectedKeys(0)).toEqual([
-      "rank",
-      "userId",
-      "username",
-      "displayName",
-      "avatarUrl",
-      "totalTokens",
-      "totalCost",
-    ]);
-    expect(selectedKeys(1)).toEqual([
-      "totalTokens",
-      "totalCost",
-      "uniqueUsers",
-    ]);
+    expect(serializeSqlCalls().some((text) =>
+      text.includes("json_build_object")
+      && text.includes("'rank'")
+      && text.includes("'userId'")
+      && text.includes("'totalCost'")
+    )).toBe(true);
     expect(Object.keys(leaderboard.users[0]).sort()).toEqual([
       "avatarUrl",
       "displayName",

@@ -1,51 +1,38 @@
 import { unstable_cache } from "next/cache";
-import { db, users, submissions, dailyBreakdown } from "@/lib/db";
+import { db, users, submissions } from "@/lib/db";
 import {
   USERNAME_LOOKUP_LIMIT,
   getSingleUsernameMatch,
   normalizeUsernameCacheKey,
   usernameEqualsIgnoreCase,
 } from "@/lib/db/usernameLookup";
-import { eq, desc, sql, and, gte, lte } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import type { LeaderboardData, LeaderboardUser, Period, SortBy } from "@/lib/leaderboard/types";
 
 export type { LeaderboardData, LeaderboardUser, Period, SortBy } from "@/lib/leaderboard/types";
-
-interface LeaderboardPeriodRow {
-  userId: string;
-  username: string;
-  displayName: string | null;
-  avatarUrl: string | null;
-  tokens: number;
-  cost: number;
-}
 
 interface PeriodDateRange {
   start: string;
   end: string;
 }
 
-interface PeriodLeaderboardDbRow {
-  userId: string;
-  username: string;
-  displayName: string | null;
-  avatarUrl: string | null;
-  tokens: number | string | null;
-  cost: number | string | null;
-}
+type LeaderboardQueryResult = Record<string, unknown> & {
+  users: unknown;
+  totalUsers: number | string | null;
+  totalTokens: number | string | null;
+  totalCost: number | string | null;
+  uniqueUsers: number | string | null;
+};
 
-interface AllTimeLeaderboardDbRow {
+type RankedLeaderboardDbRow = Record<string, unknown> & {
+  rank: number | string | null;
   userId: string;
   username: string;
   displayName: string | null;
   avatarUrl: string | null;
   totalTokens: number | string | null;
   totalCost: number | string | null;
-}
-
-interface RankedLeaderboardDbRow extends AllTimeLeaderboardDbRow {
-  rank: number | string | null;
-}
+};
 
 function toUtcDateString(date: Date): string {
   return date.toISOString().slice(0, 10);
@@ -97,177 +84,234 @@ function getPeriodDateRange(
   };
 }
 
-function compareLeaderboardUsers(
-  left: Omit<LeaderboardUser, "rank">,
-  right: Omit<LeaderboardUser, "rank">,
-  sortBy: SortBy
-): number {
-  const primary = sortBy === "cost"
-    ? right.totalCost - left.totalCost
-    : right.totalTokens - left.totalTokens;
-
-  if (primary !== 0) {
-    return primary;
-  }
-
-  const secondary = sortBy === "cost"
-    ? right.totalTokens - left.totalTokens
-    : right.totalCost - left.totalCost;
-
-  if (secondary !== 0) {
-    return secondary;
-  }
-
-  return left.username.localeCompare(right.username);
+function getSearchPattern(search: string): string {
+  const escapedSearch = search.toLowerCase().replace(/[%_\\]/g, "\\$&");
+  return `%${escapedSearch}%`;
 }
 
-function aggregatePeriodRows(
-  rows: LeaderboardPeriodRow[],
-  sortBy: SortBy
-): Array<Omit<LeaderboardUser, "rank">> {
-  const usersById = new Map<string, Omit<LeaderboardUser, "rank">>();
+function mapLeaderboardUser(row: RankedLeaderboardDbRow): LeaderboardUser {
+  return {
+    rank: Number(row.rank) || 0,
+    userId: row.userId,
+    username: row.username,
+    displayName: row.displayName,
+    avatarUrl: row.avatarUrl,
+    totalTokens: Number(row.totalTokens) || 0,
+    totalCost: Number(row.totalCost) || 0,
+  };
+}
 
-  for (const row of rows) {
-    const existing = usersById.get(row.userId);
+function parseLeaderboardUsers(value: unknown): LeaderboardUser[] {
+  let rows = value;
 
-    if (existing) {
-      existing.totalTokens += row.tokens;
-      existing.totalCost += row.cost;
-      continue;
+  if (typeof rows === "string") {
+    try {
+      rows = JSON.parse(rows);
+    } catch {
+      return [];
     }
-
-    usersById.set(row.userId, {
-      userId: row.userId,
-      username: row.username,
-      displayName: row.displayName,
-      avatarUrl: row.avatarUrl,
-      totalTokens: row.tokens,
-      totalCost: row.cost,
-    });
   }
 
-  return Array.from(usersById.values()).sort((left, right) =>
-    compareLeaderboardUsers(left, right, sortBy)
-  );
+  if (!Array.isArray(rows)) {
+    return [];
+  }
+
+  return rows.map((row) => mapLeaderboardUser(row as RankedLeaderboardDbRow));
 }
 
-function matchesLeaderboardSearch(
-  user: Pick<LeaderboardUser, "username" | "displayName">,
-  search: string
-): boolean {
-  if (!search) {
-    return true;
-  }
-
-  const lowerSearch = search.toLowerCase();
-  if (user.username.toLowerCase().includes(lowerSearch)) {
-    return true;
-  }
-  if (user.displayName && user.displayName.toLowerCase().includes(lowerSearch)) {
-    return true;
-  }
-  return false;
-}
-
-function buildPeriodLeaderboardData(
-  rows: LeaderboardPeriodRow[],
+function buildLeaderboardData(
+  row: LeaderboardQueryResult | undefined,
   page: number,
   limit: number,
   period: Period,
-  sortBy: SortBy = "tokens",
-  search: string = ""
+  sortBy: SortBy
 ): LeaderboardData {
-  const offset = (page - 1) * limit;
-  const aggregatedUsers = aggregatePeriodRows(rows, sortBy);
-  const rankedUsers = aggregatedUsers.map((user, index) => ({
-    ...user,
-    rank: index + 1,
-  }));
-  const filteredUsers = rankedUsers.filter((user) =>
-    matchesLeaderboardSearch(user, search)
-  );
-  const pagedUsers = filteredUsers.slice(offset, offset + limit);
+  const totalUsers = Number(row?.totalUsers) || 0;
+  const totalPages = Math.ceil(totalUsers / limit);
 
   return {
-    users: pagedUsers,
+    users: parseLeaderboardUsers(row?.users),
     pagination: {
       page,
       limit,
-      totalUsers: filteredUsers.length,
-      totalPages: Math.ceil(filteredUsers.length / limit),
-      hasNext: offset + limit < filteredUsers.length,
+      totalUsers,
+      totalPages,
+      hasNext: page < totalPages,
       hasPrev: page > 1,
     },
     stats: {
-      totalTokens: aggregatedUsers.reduce((sum, user) => sum + user.totalTokens, 0),
-      totalCost: aggregatedUsers.reduce((sum, user) => sum + user.totalCost, 0),
-      uniqueUsers: aggregatedUsers.length,
+      totalTokens: Number(row?.totalTokens) || 0,
+      totalCost: Number(row?.totalCost) || 0,
+      uniqueUsers: Number(row?.uniqueUsers) || 0,
     },
     period,
     sortBy,
   };
 }
 
-function buildPeriodUserRank(
-  rows: LeaderboardPeriodRow[],
-  username: string,
-  sortBy: SortBy = "tokens"
-): LeaderboardUser | null {
-  const aggregatedUsers = aggregatePeriodRows(rows, sortBy);
-  const usernameCacheKey = normalizeUsernameCacheKey(username);
-  const matchingUsers = aggregatedUsers.filter(
-    (user) => normalizeUsernameCacheKey(user.username) === usernameCacheKey
-  );
-  const user = getSingleUsernameMatch(matchingUsers, username);
-
-  if (!user) {
-    return null;
-  }
-
-  return {
-    ...user,
-    rank: aggregatedUsers.indexOf(user) + 1,
-  };
-}
-
-async function fetchPeriodLeaderboardRows(
+/**
+ * Period rankings intentionally use ROW_NUMBER over the full display ordering.
+ * This preserves the sequential ranks that the former in-memory sort assigned
+ * when primary-metric ties were resolved by the secondary metric and username.
+ */
+async function fetchPeriodLeaderboardData(
   period: Exclude<Period, "all">,
+  page: number,
+  limit: number,
+  sortBy: SortBy,
+  search: string,
   customFrom?: string,
   customTo?: string
-): Promise<LeaderboardPeriodRow[]> {
+): Promise<LeaderboardData> {
   const dateRange = getPeriodDateRange(period, new Date(), customFrom, customTo);
 
   if (!dateRange) {
-    return [];
+    return buildLeaderboardData(undefined, page, limit, period, sortBy);
   }
 
-  const rows: PeriodLeaderboardDbRow[] = await db
-    .select({
-      userId: users.id,
-      username: users.username,
-      displayName: users.displayName,
-      avatarUrl: users.avatarUrl,
-      tokens: dailyBreakdown.tokens,
-      cost: dailyBreakdown.cost,
-    })
-    .from(dailyBreakdown)
-    .innerJoin(submissions, eq(dailyBreakdown.submissionId, submissions.id))
-    .innerJoin(users, eq(submissions.userId, users.id))
-    .where(
-      and(
-        gte(dailyBreakdown.date, dateRange.start),
-        lte(dailyBreakdown.date, dateRange.end)
-      )
-    );
+  const offset = (page - 1) * limit;
+  const primaryOrderColumn = sortBy === "cost" ? sql`total_cost` : sql`total_tokens`;
+  const secondaryOrderColumn = sortBy === "cost" ? sql`total_tokens` : sql`total_cost`;
+  const searchCondition = search
+    ? sql`LOWER(username) LIKE ${getSearchPattern(search)} ESCAPE '\\' OR LOWER(COALESCE(display_name, '')) LIKE ${getSearchPattern(search)} ESCAPE '\\'`
+    : sql`TRUE`;
 
-  return rows.map((row: PeriodLeaderboardDbRow) => ({
-    userId: row.userId,
-    username: row.username,
-    displayName: row.displayName,
-    avatarUrl: row.avatarUrl,
-    tokens: Number(row.tokens) || 0,
-    cost: Number(row.cost) || 0,
-  }));
+  const result = await db.execute<LeaderboardQueryResult>(sql`
+    WITH aggregated AS (
+      SELECT
+        submissions.user_id AS user_id,
+        users.username AS username,
+        users.display_name AS display_name,
+        users.avatar_url AS avatar_url,
+        SUM(daily_breakdown.tokens) AS total_tokens,
+        SUM(CAST(daily_breakdown.cost AS DECIMAL(18,4))) AS total_cost
+      FROM daily_breakdown
+      INNER JOIN submissions ON daily_breakdown.submission_id = submissions.id
+      INNER JOIN users ON submissions.user_id = users.id
+      WHERE daily_breakdown.date >= ${dateRange.start}
+        AND daily_breakdown.date <= ${dateRange.end}
+      GROUP BY submissions.user_id, users.username, users.display_name, users.avatar_url
+    ),
+    ranked AS (
+      SELECT
+        aggregated.*,
+        ROW_NUMBER() OVER (
+          ORDER BY ${primaryOrderColumn} DESC, ${secondaryOrderColumn} DESC, LOWER(username) ASC, user_id ASC
+        ) AS rank,
+        SUM(total_tokens) OVER () AS total_tokens_all,
+        SUM(total_cost) OVER () AS total_cost_all,
+        COUNT(*) OVER () AS unique_users_all
+      FROM aggregated
+    ),
+    filtered AS (
+      SELECT ranked.*, COUNT(*) OVER () AS filtered_users
+      FROM ranked
+      WHERE ${searchCondition}
+    ),
+    paged AS (
+      SELECT *
+      FROM filtered
+      ORDER BY rank ASC
+      LIMIT ${limit}
+      OFFSET ${offset}
+    )
+    SELECT
+      COALESCE(
+        (
+          SELECT json_agg(
+            json_build_object(
+              'rank', rank,
+              'userId', user_id,
+              'username', username,
+              'displayName', display_name,
+              'avatarUrl', avatar_url,
+              'totalTokens', total_tokens,
+              'totalCost', total_cost
+            )
+            ORDER BY rank ASC
+          )
+          FROM paged
+        ),
+        '[]'::json
+      ) AS users,
+      COALESCE((SELECT filtered_users FROM filtered LIMIT 1), 0)::int AS "totalUsers",
+      COALESCE((SELECT total_tokens_all FROM ranked LIMIT 1), 0) AS "totalTokens",
+      COALESCE((SELECT total_cost_all FROM ranked LIMIT 1), 0) AS "totalCost",
+      COALESCE((SELECT unique_users_all FROM ranked LIMIT 1), 0)::int AS "uniqueUsers"
+  `);
+
+  return buildLeaderboardData(result[0], page, limit, period, sortBy);
+}
+
+async function fetchAllTimeLeaderboardData(
+  page: number,
+  limit: number,
+  sortBy: SortBy,
+  search: string
+): Promise<LeaderboardData> {
+  const offset = (page - 1) * limit;
+  const primaryOrderColumn = sortBy === "cost" ? sql`total_cost` : sql`total_tokens`;
+  const secondaryOrderColumn = sortBy === "cost" ? sql`total_tokens` : sql`total_cost`;
+  const searchCondition = search
+    ? sql`LOWER(username) LIKE ${getSearchPattern(search)} ESCAPE '\\' OR LOWER(COALESCE(display_name, '')) LIKE ${getSearchPattern(search)} ESCAPE '\\'`
+    : sql`TRUE`;
+
+  // submissions.user_id is unique. Keep this path row-based rather than
+  // grouping every submission on each request.
+  const result = await db.execute<LeaderboardQueryResult>(sql`
+    WITH ranked AS (
+      SELECT
+        submissions.user_id AS user_id,
+        users.username AS username,
+        users.display_name AS display_name,
+        users.avatar_url AS avatar_url,
+        submissions.total_tokens AS total_tokens,
+        CAST(submissions.total_cost AS DECIMAL(18,4)) AS total_cost,
+        RANK() OVER (ORDER BY ${primaryOrderColumn} DESC) AS rank,
+        SUM(submissions.total_tokens) OVER () AS total_tokens_all,
+        SUM(CAST(submissions.total_cost AS DECIMAL(18,4))) OVER () AS total_cost_all,
+        COUNT(*) OVER () AS unique_users_all
+      FROM submissions
+      INNER JOIN users ON submissions.user_id = users.id
+    ),
+    filtered AS (
+      SELECT ranked.*, COUNT(*) OVER () AS filtered_users
+      FROM ranked
+      WHERE ${searchCondition}
+    ),
+    paged AS (
+      SELECT *
+      FROM filtered
+      ORDER BY rank ASC, ${secondaryOrderColumn} DESC, LOWER(username) ASC, user_id ASC
+      LIMIT ${limit}
+      OFFSET ${offset}
+    )
+    SELECT
+      COALESCE(
+        (
+          SELECT json_agg(
+            json_build_object(
+              'rank', rank,
+              'userId', user_id,
+              'username', username,
+              'displayName', display_name,
+              'avatarUrl', avatar_url,
+              'totalTokens', total_tokens,
+              'totalCost', total_cost
+            )
+            ORDER BY rank ASC, ${secondaryOrderColumn} DESC, LOWER(username) ASC, user_id ASC
+          )
+          FROM paged
+        ),
+        '[]'::json
+      ) AS users,
+      COALESCE((SELECT filtered_users FROM filtered LIMIT 1), 0)::int AS "totalUsers",
+      COALESCE((SELECT total_tokens_all FROM ranked LIMIT 1), 0) AS "totalTokens",
+      COALESCE((SELECT total_cost_all FROM ranked LIMIT 1), 0) AS "totalCost",
+      COALESCE((SELECT unique_users_all FROM ranked LIMIT 1), 0)::int AS "uniqueUsers"
+  `);
+
+  return buildLeaderboardData(result[0], page, limit, "all", sortBy);
 }
 
 async function fetchLeaderboardData(
@@ -280,162 +324,18 @@ async function fetchLeaderboardData(
   customTo?: string
 ): Promise<LeaderboardData> {
   if (period !== "all") {
-    const rows = await fetchPeriodLeaderboardRows(period, customFrom, customTo);
-    return buildPeriodLeaderboardData(rows, page, limit, period, sortBy, search);
-  }
-
-  const offset = (page - 1) * limit;
-
-  const orderByColumn = sortBy === "cost"
-    ? sql`SUM(CAST(${submissions.totalCost} AS DECIMAL(18,4)))`
-    : sql`SUM(${submissions.totalTokens})`;
-  const secondaryOrderByColumn = sortBy === "cost"
-    ? sql`SUM(${submissions.totalTokens})`
-    : sql`SUM(CAST(${submissions.totalCost} AS DECIMAL(18,4)))`;
-
-  if (search) {
-    // When searching, use a subquery to compute global ranks for ALL users,
-    // then filter by username. This preserves each user's true rank.
-    const rankedSubquery = db
-      .select({
-        rank: sql<number>`RANK() OVER (ORDER BY ${orderByColumn} DESC)`.as("rank"),
-        userId: users.id,
-        username: users.username,
-        displayName: users.displayName,
-        avatarUrl: users.avatarUrl,
-        totalTokens: sql<number>`SUM(${submissions.totalTokens})`.as("total_tokens"),
-        totalCost: sql<number>`SUM(CAST(${submissions.totalCost} AS DECIMAL(18,4)))`.as("total_cost"),
-      })
-      .from(submissions)
-      .innerJoin(users, eq(submissions.userId, users.id))
-      .groupBy(users.id, users.username, users.displayName, users.avatarUrl)
-      .as("ranked");
-    const rankedSecondaryOrderByColumn = sortBy === "cost"
-      ? rankedSubquery.totalTokens
-      : rankedSubquery.totalCost;
-
-    const escapedSearch = search.toLowerCase().replace(/[%_\\]/g, "\\$&");
-    const searchPattern = `%${escapedSearch}%`;
-    const results = await db
-      .select()
-      .from(rankedSubquery)
-      .where(sql`(LOWER(${rankedSubquery.username}) LIKE ${searchPattern} OR LOWER(COALESCE(${rankedSubquery.displayName}, '')) LIKE ${searchPattern})`)
-      .orderBy(
-        sql`${rankedSubquery.rank} ASC`,
-        sql`${rankedSecondaryOrderByColumn} DESC`,
-        sql`LOWER(${rankedSubquery.username}) ASC`
-      )
-      .limit(limit)
-      .offset(offset);
-
-    // Count total matching users for pagination
-    const countResult = await db
-      .select({ count: sql<number>`COUNT(*)`.as("count") })
-      .from(rankedSubquery)
-      .where(sql`(LOWER(${rankedSubquery.username}) LIKE ${searchPattern} OR LOWER(COALESCE(${rankedSubquery.displayName}, '')) LIKE ${searchPattern})`);
-
-    const totalUsers = Number(countResult[0]?.count) || 0;
-    const totalPages = Math.ceil(totalUsers / limit);
-
-    // Global stats remain unfiltered
-    const globalStats = await db
-      .select({
-        totalTokens: sql<number>`SUM(${submissions.totalTokens})`,
-        totalCost: sql<number>`SUM(CAST(${submissions.totalCost} AS DECIMAL(18,4)))`,
-        uniqueUsers: sql<number>`COUNT(DISTINCT ${submissions.userId})`,
-      })
-      .from(submissions);
-
-    return {
-      users: (results as RankedLeaderboardDbRow[]).map((row) => ({
-        rank: Number(row.rank),
-        userId: row.userId,
-        username: row.username,
-        displayName: row.displayName,
-        avatarUrl: row.avatarUrl,
-        totalTokens: Number(row.totalTokens) || 0,
-        totalCost: Number(row.totalCost) || 0,
-      })),
-      pagination: {
-        page,
-        limit,
-        totalUsers,
-        totalPages,
-        hasNext: page < totalPages,
-        hasPrev: page > 1,
-      },
-      stats: {
-        totalTokens: Number(globalStats[0]?.totalTokens) || 0,
-        totalCost: Number(globalStats[0]?.totalCost) || 0,
-        uniqueUsers: Number(globalStats[0]?.uniqueUsers) || 0,
-      },
+    return fetchPeriodLeaderboardData(
       period,
-      sortBy,
-    };
-  }
-
-  // Non-search path: competition rank with deterministic row ordering for ties.
-  const leaderboardQuery = db
-    .select({
-      rank: sql<number>`RANK() OVER (ORDER BY ${orderByColumn} DESC)`.as("rank"),
-      userId: users.id,
-      username: users.username,
-      displayName: users.displayName,
-      avatarUrl: users.avatarUrl,
-      totalTokens: sql<number>`SUM(${submissions.totalTokens})`.as("total_tokens"),
-      totalCost: sql<number>`SUM(CAST(${submissions.totalCost} AS DECIMAL(18,4)))`.as("total_cost"),
-    })
-    .from(submissions)
-    .innerJoin(users, eq(submissions.userId, users.id))
-    .groupBy(users.id, users.username, users.displayName, users.avatarUrl)
-    .orderBy(
-      desc(orderByColumn),
-      desc(secondaryOrderByColumn),
-      sql`LOWER(${users.username}) ASC`
-    )
-    .limit(limit)
-    .offset(offset);
-
-  const [results, globalStats] = await Promise.all([
-    leaderboardQuery,
-    db
-      .select({
-        totalTokens: sql<number>`SUM(${submissions.totalTokens})`,
-        totalCost: sql<number>`SUM(CAST(${submissions.totalCost} AS DECIMAL(18,4)))`,
-        uniqueUsers: sql<number>`COUNT(DISTINCT ${submissions.userId})`,
-      })
-      .from(submissions),
-  ]);
-
-  const totalUsers = Number(globalStats[0]?.uniqueUsers) || 0;
-  const totalPages = Math.ceil(totalUsers / limit);
-
-  return {
-    users: (results as RankedLeaderboardDbRow[]).map((row) => ({
-      rank: Number(row.rank),
-      userId: row.userId,
-      username: row.username,
-      displayName: row.displayName,
-      avatarUrl: row.avatarUrl,
-      totalTokens: Number(row.totalTokens) || 0,
-      totalCost: Number(row.totalCost) || 0,
-    })),
-    pagination: {
       page,
       limit,
-      totalUsers,
-      totalPages,
-      hasNext: page < totalPages,
-      hasPrev: page > 1,
-    },
-    stats: {
-      totalTokens: Number(globalStats[0]?.totalTokens) || 0,
-      totalCost: Number(globalStats[0]?.totalCost) || 0,
-      uniqueUsers: Number(globalStats[0]?.uniqueUsers) || 0,
-    },
-    period,
-    sortBy,
-  };
+      sortBy,
+      search,
+      customFrom,
+      customTo
+    );
+  }
+
+  return fetchAllTimeLeaderboardData(page, limit, sortBy, search);
 }
 
 export function getLeaderboardData(
@@ -465,6 +365,61 @@ export function getLeaderboardData(
 // USER RANK
 // ============================================================================
 
+async function fetchPeriodUserRank(
+  username: string,
+  period: Exclude<Period, "all">,
+  sortBy: SortBy,
+  customFrom?: string,
+  customTo?: string
+): Promise<LeaderboardUser | null> {
+  const dateRange = getPeriodDateRange(period, new Date(), customFrom, customTo);
+
+  if (!dateRange) {
+    return null;
+  }
+
+  const primaryOrderColumn = sortBy === "cost" ? sql`total_cost` : sql`total_tokens`;
+  const secondaryOrderColumn = sortBy === "cost" ? sql`total_tokens` : sql`total_cost`;
+  const results = await db.execute<RankedLeaderboardDbRow>(sql`
+    WITH aggregated AS (
+      SELECT
+        submissions.user_id AS user_id,
+        users.username AS username,
+        users.display_name AS display_name,
+        users.avatar_url AS avatar_url,
+        SUM(daily_breakdown.tokens) AS total_tokens,
+        SUM(CAST(daily_breakdown.cost AS DECIMAL(18,4))) AS total_cost
+      FROM daily_breakdown
+      INNER JOIN submissions ON daily_breakdown.submission_id = submissions.id
+      INNER JOIN users ON submissions.user_id = users.id
+      WHERE daily_breakdown.date >= ${dateRange.start}
+        AND daily_breakdown.date <= ${dateRange.end}
+      GROUP BY submissions.user_id, users.username, users.display_name, users.avatar_url
+    ),
+    ranked AS (
+      SELECT
+        aggregated.*,
+        ROW_NUMBER() OVER (
+          ORDER BY ${primaryOrderColumn} DESC, ${secondaryOrderColumn} DESC, LOWER(username) ASC, user_id ASC
+        ) AS rank
+      FROM aggregated
+    )
+    SELECT
+      rank,
+      user_id AS "userId",
+      username,
+      display_name AS "displayName",
+      avatar_url AS "avatarUrl",
+      total_tokens AS "totalTokens",
+      total_cost AS "totalCost"
+    FROM ranked
+    WHERE LOWER(username) = LOWER(${username})
+  `);
+
+  const row = getSingleUsernameMatch(results, username);
+  return row ? mapLeaderboardUser(row) : null;
+}
+
 async function fetchUserRank(
   username: string,
   period: Period,
@@ -473,8 +428,7 @@ async function fetchUserRank(
   customTo?: string
 ): Promise<LeaderboardUser | null> {
   if (period !== "all") {
-    const rows = await fetchPeriodLeaderboardRows(period, customFrom, customTo);
-    return buildPeriodUserRank(rows, username, sortBy);
+    return fetchPeriodUserRank(username, period, sortBy, customFrom, customTo);
   }
 
   const userResult = await db
@@ -491,42 +445,33 @@ async function fetchUserRank(
 
   const userStatsResult = await db
     .select({
-      totalTokens: sql<number>`SUM(${submissions.totalTokens})`.as("total_tokens"),
-      totalCost: sql<number>`SUM(CAST(${submissions.totalCost} AS DECIMAL(18,4)))`.as("total_cost"),
+      totalTokens: submissions.totalTokens,
+      totalCost: sql<number>`CAST(${submissions.totalCost} AS DECIMAL(18,4))`.as("total_cost"),
     })
     .from(submissions)
     .where(eq(submissions.userId, user.id));
 
-  if (!userStatsResult[0] || userStatsResult[0].totalTokens == null) {
+  if (!userStatsResult[0]) {
     return null;
   }
 
   const userStats = userStatsResult[0];
-  const userTotalTokens = Number(userStats.totalTokens);
-  const userTotalCost = userStats.totalCost != null ? Number(userStats.totalCost) : 0;
+  const userTotalTokens = Number(userStats.totalTokens) || 0;
+  const userTotalCost = Number(userStats.totalCost) || 0;
 
   const userCompareValue = sortBy === "cost"
     ? userTotalCost
     : userTotalTokens;
   const compareColumn = sortBy === "cost"
-    ? sql`SUM(CAST(${submissions.totalCost} AS DECIMAL(18,4)))`
-    : sql`SUM(${submissions.totalTokens})`;
+    ? sql`CAST(${submissions.totalCost} AS DECIMAL(18,4))`
+    : submissions.totalTokens;
 
   const higherRankedResult = await db
     .select({
       count: sql<number>`COUNT(*)`.as("count"),
     })
-    .from(
-      db
-        .select({
-          userId: submissions.userId,
-          total: compareColumn.as("total"),
-        })
-        .from(submissions)
-        .groupBy(submissions.userId)
-        .having(sql`${compareColumn} > ${userCompareValue}`)
-        .as("higher_ranked")
-    );
+    .from(submissions)
+    .where(sql`${compareColumn} > ${userCompareValue}`);
 
   const rank = Number(higherRankedResult[0]?.count || 0) + 1;
 
