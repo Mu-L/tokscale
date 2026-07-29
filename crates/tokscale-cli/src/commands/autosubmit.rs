@@ -15,6 +15,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const JOB_ID: &str = "ai.tokscale.autosubmit";
+/// Version of the build answering the current call, stamped into settings when
+/// the managed copy is written so later runs can tell whether it has drifted.
+const RUNNING_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CRON_MARKER_BEGIN: &str = "# BEGIN TOKSCALE AUTOSUBMIT";
 const CRON_MARKER_END: &str = "# END TOKSCALE AUTOSUBMIT";
 const SKIP_SCHEDULER_ENV: &str = "TOKSCALE_AUTOSUBMIT_SKIP_SCHEDULER";
@@ -170,6 +173,12 @@ struct StatusOutput {
     yesterday: bool,
     week: bool,
     month: bool,
+    managed_executable: Option<String>,
+    managed_executable_version: Option<String>,
+    /// True when the scheduled copy came from a different build than the one
+    /// answering this call. Scripted health checks read this rather than
+    /// diffing the two version strings themselves.
+    managed_executable_stale: bool,
     last_run_at_ms: Option<i64>,
     last_error: Option<String>,
 }
@@ -213,6 +222,7 @@ where
         last_run_at_ms: previous_settings.autosubmit.last_run_at_ms,
         last_error: None,
         managed_executable: None,
+        managed_executable_version: None,
     };
     let source_exe =
         std::env::current_exe().context("Could not resolve current tokscale executable")?;
@@ -239,6 +249,9 @@ where
     };
     let mut next_autosubmit = next_autosubmit;
     next_autosubmit.managed_executable = Some(exe.to_string_lossy().into_owned());
+    // Stamped from the build doing the copying, not read back off the file, so
+    // it describes what the scheduler will actually run.
+    next_autosubmit.managed_executable_version = Some(RUNNING_VERSION.to_string());
 
     let mut next_settings = previous_settings.clone();
     next_settings.autosubmit = next_autosubmit;
@@ -333,6 +346,17 @@ pub fn status(json: bool) -> Result<()> {
         } else {
             println!("  Clients: default submit clients");
         }
+        if managed_executable_is_stale(&autosubmit) {
+            let scheduled = autosubmit
+                .managed_executable_version
+                .as_deref()
+                .unwrap_or("unknown");
+            println!(
+                "  Scheduled binary: {scheduled} (this build is {RUNNING_VERSION})\n    \
+                 The scheduler runs its own copy, which upgrades do not replace. \
+                 Re-run `tokscale autosubmit enable` to refresh it."
+            );
+        }
     } else {
         println!("Autosubmit is disabled.");
     }
@@ -374,6 +398,7 @@ where
 
     settings.autosubmit.enabled = false;
     settings.autosubmit.managed_executable = None;
+    settings.autosubmit.managed_executable_version = None;
     settings.autosubmit.last_error = None;
     settings.save()?;
     println!("Autosubmit disabled.");
@@ -450,6 +475,53 @@ pub fn try_acquire_run_lock() -> Result<Option<AutosubmitRunLock>> {
     }
 }
 
+/// Whether the scheduled copy came from a different build than the one running
+/// now, meaning the scheduler is submitting with stale code.
+///
+/// `enable` is the only writer of the managed copy, so replacing the installed
+/// binary — `npm update -g tokscale`, brew, or dropping in a new binary — does
+/// not touch it and the scheduled job silently keeps the old build.
+///
+/// Compared by version rather than by content. Hashing would additionally catch
+/// same-version rebuilds, which only developers produce, at the cost of reading
+/// the whole binary on every status call.
+///
+/// Any difference counts, not just an older recorded version: a deliberate
+/// downgrade is drift too. The question being answered is "what is the
+/// scheduler actually running", not "which build is newer".
+fn managed_executable_is_stale(settings: &AutosubmitSettings) -> bool {
+    if !settings.enabled {
+        return false;
+    }
+    let Some(managed) = settings.managed_executable.as_deref() else {
+        return false;
+    };
+    // Invoking the managed copy directly compares it against itself, which
+    // always matches and says nothing. Report no drift rather than a spurious
+    // clean bill of health from a binary that cannot observe its own staleness.
+    if running_executable_is(managed) {
+        return false;
+    }
+    // `None` predates this field, so the recorded build is genuinely unknown
+    // and reported as drift. It resolves on the next enable.
+    settings.managed_executable_version.as_deref() != Some(RUNNING_VERSION)
+}
+
+/// Whether the process answering this call is the binary at `path`, compared
+/// through the filesystem so a symlinked or relative path still matches.
+fn running_executable_is(path: &str) -> bool {
+    let Ok(current) = std::env::current_exe() else {
+        return false;
+    };
+    let candidate = Path::new(path);
+    match (current.canonicalize(), candidate.canonicalize()) {
+        (Ok(current), Ok(candidate)) => current == candidate,
+        // A managed copy that no longer exists cannot be the running process,
+        // and is a separate problem from drift.
+        _ => current == candidate,
+    }
+}
+
 fn status_output(settings: &AutosubmitSettings) -> StatusOutput {
     StatusOutput {
         enabled: settings.enabled,
@@ -463,6 +535,9 @@ fn status_output(settings: &AutosubmitSettings) -> StatusOutput {
         yesterday: settings.yesterday,
         week: settings.week,
         month: settings.month,
+        managed_executable: settings.managed_executable.clone(),
+        managed_executable_version: settings.managed_executable_version.clone(),
+        managed_executable_stale: managed_executable_is_stale(settings),
         last_run_at_ms: settings.last_run_at_ms,
         last_error: settings.last_error.clone(),
     }
@@ -1498,16 +1573,44 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use tempfile::TempDir;
 
+    /// Serializes every test that redirects `TOKSCALE_CONFIG_DIR`.
+    ///
+    /// The env is process-global while cargo runs tests on parallel threads, so
+    /// two such tests otherwise read each other's config directory: one saves
+    /// settings, the other's guard restores the variable underneath it, and the
+    /// first then loads from the wrong place. That was latent rather than
+    /// theoretical — the suite passed only because of scheduling luck, and
+    /// adding two more config-directory tests was enough to make it fail
+    /// differently on every run.
+    ///
+    /// Holding the lock inside the guard means every existing caller is
+    /// serialized without changing a single test body. No test takes two guards
+    /// at once, so this cannot deadlock.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<OsString>,
+        // Released on drop, after the variable is restored below.
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl EnvVarGuard {
         fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+            // A test that panicked while holding the lock poisons it. The env
+            // is restored by the guard's Drop regardless, so the data is not
+            // actually corrupt and recovering keeps one failure from cascading
+            // into every later test.
+            let lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let previous = env::var_os(key);
             env::set_var(key, value);
-            Self { key, previous }
+            Self {
+                key,
+                previous,
+                _lock: lock,
+            }
         }
     }
 
@@ -2265,5 +2368,139 @@ mod tests {
         assert!(try_acquire_run_lock().unwrap().is_none());
         drop(first);
         assert!(try_acquire_run_lock().unwrap().is_some());
+    }
+    /// The scheduler runs its own copy, so an upgrade that replaces the
+    /// installed binary leaves it behind. These pin the detection, because the
+    /// drift itself is silent by construction.
+    #[test]
+    fn managed_executable_stale_reports_a_version_change() {
+        let settings = AutosubmitSettings {
+            enabled: true,
+            managed_executable: Some("/nonexistent/managed/tokscale".to_string()),
+            managed_executable_version: Some("0.0.1-old".to_string()),
+            ..AutosubmitSettings::default()
+        };
+        assert!(managed_executable_is_stale(&settings));
+    }
+
+    #[test]
+    fn managed_executable_stale_is_quiet_when_versions_match() {
+        let settings = AutosubmitSettings {
+            enabled: true,
+            managed_executable: Some("/nonexistent/managed/tokscale".to_string()),
+            managed_executable_version: Some(RUNNING_VERSION.to_string()),
+            ..AutosubmitSettings::default()
+        };
+        assert!(!managed_executable_is_stale(&settings));
+    }
+
+    #[test]
+    fn managed_executable_stale_is_quiet_when_autosubmit_is_disabled() {
+        // Nothing is scheduled, so a stale copy submits nothing and warning
+        // about it would be noise.
+        let settings = AutosubmitSettings {
+            enabled: false,
+            managed_executable: Some("/nonexistent/managed/tokscale".to_string()),
+            managed_executable_version: Some("0.0.1-old".to_string()),
+            ..AutosubmitSettings::default()
+        };
+        assert!(!managed_executable_is_stale(&settings));
+    }
+
+    #[test]
+    fn managed_executable_stale_treats_a_missing_version_as_drift() {
+        // Configs written before the field existed. The recorded build is
+        // genuinely unknown, so claiming it is current would be a guess.
+        let settings = AutosubmitSettings {
+            enabled: true,
+            managed_executable: Some("/nonexistent/managed/tokscale".to_string()),
+            managed_executable_version: None,
+            ..AutosubmitSettings::default()
+        };
+        assert!(managed_executable_is_stale(&settings));
+    }
+
+    #[test]
+    fn managed_executable_stale_ignores_self_invocation() {
+        // Running the managed copy compares it against itself, which always
+        // matches and proves nothing -- a binary cannot observe its own
+        // staleness. Deliberately reports no drift rather than a false all-clear
+        // derived from the version mismatch below.
+        let running = std::env::current_exe().unwrap();
+        let settings = AutosubmitSettings {
+            enabled: true,
+            managed_executable: Some(running.to_string_lossy().into_owned()),
+            managed_executable_version: Some("0.0.1-old".to_string()),
+            ..AutosubmitSettings::default()
+        };
+        assert!(!managed_executable_is_stale(&settings));
+    }
+
+    #[test]
+    fn status_output_surfaces_the_scheduled_build() {
+        let settings = AutosubmitSettings {
+            enabled: true,
+            managed_executable: Some("/nonexistent/managed/tokscale".to_string()),
+            managed_executable_version: Some("0.0.1-old".to_string()),
+            ..AutosubmitSettings::default()
+        };
+        let output = status_output(&settings);
+        assert_eq!(
+            output.managed_executable.as_deref(),
+            Some("/nonexistent/managed/tokscale")
+        );
+        assert_eq!(
+            output.managed_executable_version.as_deref(),
+            Some("0.0.1-old")
+        );
+        assert!(
+            output.managed_executable_stale,
+            "scripted checks read the boolean rather than diffing versions themselves"
+        );
+    }
+
+    #[test]
+    fn enable_records_the_running_version_beside_the_managed_copy() {
+        let temp = TempDir::new().unwrap();
+        let _guard = EnvVarGuard::set("TOKSCALE_CONFIG_DIR", temp.path());
+
+        enable_with_scheduler_operations(
+            enable_args(SchedulerKind::Cron),
+            |_, _, _| Ok(()),
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+
+        let saved = crate::tui::settings::Settings::load().autosubmit;
+        assert_eq!(
+            saved.managed_executable_version.as_deref(),
+            Some(RUNNING_VERSION),
+            "without this the next run cannot tell a stale scheduled job from a current one"
+        );
+        assert!(saved.managed_executable.is_some());
+    }
+
+    #[test]
+    fn disable_clears_the_recorded_managed_version() {
+        let temp = TempDir::new().unwrap();
+        let _guard = EnvVarGuard::set("TOKSCALE_CONFIG_DIR", temp.path());
+        let mut settings = crate::tui::settings::Settings::load();
+        settings.autosubmit = AutosubmitSettings {
+            enabled: true,
+            scheduler: Some(SchedulerKind::Cron.as_str().to_string()),
+            managed_executable: Some("/nonexistent/managed/tokscale".to_string()),
+            managed_executable_version: Some("0.0.1-old".to_string()),
+            ..AutosubmitSettings::default()
+        };
+        settings.save().unwrap();
+
+        disable_with_scheduler_operations(|_, _| Ok(()), || Ok(())).unwrap();
+
+        let saved = crate::tui::settings::Settings::load().autosubmit;
+        assert_eq!(saved.managed_executable, None);
+        assert_eq!(
+            saved.managed_executable_version, None,
+            "a stale version left behind would make the next enable look like drift"
+        );
     }
 }
