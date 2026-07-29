@@ -249,9 +249,14 @@ where
     };
     let mut next_autosubmit = next_autosubmit;
     next_autosubmit.managed_executable = Some(exe.to_string_lossy().into_owned());
-    // Stamped from the build doing the copying, not read back off the file, so
-    // it describes what the scheduler will actually run.
-    next_autosubmit.managed_executable_version = Some(RUNNING_VERSION.to_string());
+    // The version is deliberately NOT stamped here. This save happens before the
+    // scheduler is installed, and on Windows `exe` is a freshly versioned path
+    // while the task still points at the previous one. Recording the version now
+    // would mean that a re-enable killed between this save and the install below
+    // leaves settings claiming a build the scheduler is not running, and
+    // `managed_executable_is_stale` would report clean at exactly the moment it
+    // is wrong. It is stamped after installation succeeds instead; until then
+    // `None` reads as "unknown", which reports drift.
 
     let mut next_settings = previous_settings.clone();
     next_settings.autosubmit = next_autosubmit;
@@ -314,6 +319,20 @@ where
                 &mut uninstaller,
             );
         }
+    }
+
+    // Second phase of the version stamp: only now is the scheduler actually
+    // pointing at `exe`, so only now does recording its build describe reality.
+    //
+    // A failure here is not worth unwinding a correctly installed scheduler. The
+    // version stays `None`, status reports drift, and re-running `enable` clears
+    // it — the conservative direction, and self-healing.
+    next_settings.autosubmit.managed_executable_version = Some(RUNNING_VERSION.to_string());
+    if let Err(error) = next_settings.save() {
+        eprintln!(
+            "Warning: autosubmit is enabled, but the scheduled build could not be recorded: {error}\n         \
+             `tokscale autosubmit status` will report it as out of date until you re-run `enable`."
+        );
     }
 
     println!(
@@ -2456,6 +2475,50 @@ mod tests {
         assert!(
             output.managed_executable_stale,
             "scripted checks read the boolean rather than diffing versions themselves"
+        );
+    }
+
+    #[test]
+    fn enable_withholds_the_version_until_the_scheduler_is_installed() {
+        use std::cell::Cell;
+
+        // On Windows a re-enable writes a freshly versioned copy while the task
+        // still points at the previous one, so a process killed between the
+        // first settings save and the scheduler install would leave settings
+        // claiming a build the scheduler is not running -- and the stale check
+        // would report clean at exactly the moment it is wrong. Recording the
+        // version only after installation means an interrupted enable leaves
+        // `None`, which reads as unknown and reports drift.
+        let temp = TempDir::new().unwrap();
+        let _guard = EnvVarGuard::set("TOKSCALE_CONFIG_DIR", temp.path());
+        let observed = Cell::new(Some(String::new()));
+
+        enable_with_scheduler_operations(
+            enable_args(SchedulerKind::Cron),
+            |_, _, _| {
+                observed.set(
+                    crate::tui::settings::Settings::load()
+                        .autosubmit
+                        .managed_executable_version,
+                );
+                Ok(())
+            },
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            observed.take(),
+            None,
+            "the version must not be persisted before the scheduler points at the new copy"
+        );
+        assert_eq!(
+            crate::tui::settings::Settings::load()
+                .autosubmit
+                .managed_executable_version
+                .as_deref(),
+            Some(RUNNING_VERSION),
+            "and must be persisted once installation succeeds"
         );
     }
 
