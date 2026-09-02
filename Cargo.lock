@@ -2168,7 +2168,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3222,6 +3222,7 @@ dependencies = [
  "unicode-width 0.2.0",
  "usvg",
  "uuid",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 
