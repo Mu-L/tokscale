@@ -1000,6 +1000,14 @@ fn cmd_with_home(tmp: &Path) -> Command {
         // `pricing` intentionally bypasses TOKSCALE_PRICING_CACHE_ONLY; the
         // loopback proxies below are the offline guarantee for every command.
         .env("TOKSCALE_PRICING_CACHE_ONLY", "1")
+        // Point every API call at a dead loopback port. `get_api_base_url`
+        // reads TOKSCALE_API_URL and falls back to https://tokscale.ai, and
+        // submit, autosubmit run, login and delete-submitted-data all format
+        // their endpoint onto it. Unpinned, those commands hit production with
+        // whatever token the test set, stopped only by the proxies below — a
+        // guard a `.no_proxy()` on one client would silently remove. Pinning it
+        // here also drops any TOKSCALE_API_URL a developer has exported.
+        .env("TOKSCALE_API_URL", "http://127.0.0.1:9")
         // Keep cache-only fixtures offline even if a future code path ignores
         // the cache-only switch or a developer has proxy variables configured.
         .env("HTTP_PROXY", "http://127.0.0.1:9")
@@ -1052,6 +1060,8 @@ fn offline_cmd_with_home(tmp: &Path) -> Command {
         .env("XDG_DATA_HOME", tmp.join(".local/share"))
         .env("XDG_CACHE_HOME", tmp.join(".cache"))
         .env("TOKSCALE_CONFIG_DIR", sandbox_config_dir(tmp))
+        // Same production-endpoint pin as cmd_with_home.
+        .env("TOKSCALE_API_URL", "http://127.0.0.1:9")
         .env("HTTP_PROXY", "http://127.0.0.1:9")
         .env("HTTPS_PROXY", "http://127.0.0.1:9")
         .env("ALL_PROXY", "http://127.0.0.1:9")
@@ -2947,6 +2957,166 @@ fn test_submit_dry_run_preserves_local_date_ahead_of_utc() {
             "Date range: {expected_local_date} to {expected_local_date}"
         )))
         .stdout(predicate::str::contains("Total tokens: 1,750"));
+}
+
+/// Regression: an unbounded `submit` re-scans every client directory, and the
+/// silent wait used to give no hint of what was being scanned or how long it
+/// took. The scope label and the elapsed time are the observability for that
+/// wait; neither changes what gets submitted.
+#[test]
+fn test_submit_reports_scan_scope_and_elapsed() {
+    let tmp = create_temp_fixture_dir();
+    cmd_with_home(tmp.path())
+        .env("TOKSCALE_API_TOKEN", "test-token")
+        .args([
+            "--no-spinner",
+            "submit",
+            "--client",
+            "opencode",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Scanning local session data (1 client, full history)...",
+        ))
+        .stdout(predicate::str::is_match(r"Scanned in \d+\.\d+s\.").unwrap())
+        // The scan is already narrowed to one client, so the tip has nothing
+        // left to suggest.
+        .stdout(predicate::str::contains("Tip:").not());
+
+    cmd_with_home(tmp.path())
+        .env("TOKSCALE_API_TOKEN", "test-token")
+        .args([
+            "--no-spinner",
+            "submit",
+            "--client",
+            "opencode",
+            "--since",
+            "2026-01-01",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Scanning local session data (1 client, since 2026-01-01)...",
+        ))
+        .stdout(predicate::str::contains("Tip:").not());
+
+    cmd_with_home(tmp.path())
+        .env("TOKSCALE_API_TOKEN", "test-token")
+        .args([
+            "--no-spinner",
+            "submit",
+            "--client",
+            "synthetic",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "Scanning local session data ({} clients, full history)...",
+            tokscale_core::ClientId::COUNT
+        )));
+}
+
+/// The tip may name `--client` and nothing else.
+///
+/// `--since` does not shorten the scan: the date filters are `retain`
+/// predicates run over already-parsed messages, so the same files are read
+/// either way. It also clears `fullHistory` on the scan scope, and
+/// `planParserHighWaterSubmission` (packages/frontend/src/lib/db/parserHighWater.ts)
+/// freezes a partial snapshot for every client in `SUPPORTED_VERSIONED_PARSERS`
+/// — copilot, droid, antigravity-cli and antigravity. Advertising it as a
+/// speedup costs the user data.
+#[test]
+fn test_submit_tip_recommends_only_the_client_filter() {
+    let tmp = create_temp_fixture_dir();
+    cmd_with_home(tmp.path())
+        .env("TOKSCALE_API_TOKEN", "test-token")
+        .args(["--no-spinner", "submit", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Tip: narrow the scan with `--client <id>` for a faster submit.",
+        ))
+        .stdout(predicate::str::is_match(r"Tip:.*--since").unwrap().not());
+}
+
+/// Autosubmit's stdout is the scheduler's log file (`StandardOutPath` in the
+/// launchd plist, the systemd/cron redirect elsewhere), so the tip would be
+/// appended to it on every scheduled run with nobody at a prompt to act on it.
+///
+/// This covers the observable behavior end to end. It does not isolate the mode
+/// gate on its own — `submit_filters` always hands `run_submit_command` a
+/// client list, so the already-narrowed gate would suppress the tip here too.
+/// `client_scope_tip_is_interactive_only` in main.rs is the test that flips
+/// only the mode.
+///
+/// The home is deliberately empty of session data, and that is load-bearing.
+/// `autosubmit run` is the one submit path in this file that is not a dry run
+/// (`run_submit_command(.., dry_run = false, ..)` at the `AutosubmitRunDecision`
+/// call site), so any usage at all carries it past the `total_tokens == 0`
+/// short-circuit and into a real `POST {api}/api/submit` with
+/// `Authorization: Bearer test-token`. With `create_temp_fixture_dir` here the
+/// run reached "Submitting to server..." and issued that POST against
+/// `https://tokscale.ai`; the loopback proxies were all that kept the packet on
+/// the machine. `cmd_with_home` now also pins `TOKSCALE_API_URL` to a dead
+/// loopback port, so no test resolves the production endpoint any more — but
+/// an empty home is still what keeps *this* test off the submit path entirely.
+/// It ends the run at "No usage data found to submit." instead, which is what
+/// the last assertion pins, and the scope line and the tip gate are observable
+/// either way.
+///
+/// `prime_pricing_cache` is still needed: the pricing load runs before the
+/// usage check and ignores `TOKSCALE_PRICING_CACHE_ONLY`.
+#[test]
+fn test_autosubmit_run_omits_the_scan_scope_tip() {
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    prime_pricing_cache(tmp.path());
+    write_settings_json(tmp.path(), r#"{"autosubmit":{"enabled":true}}"#);
+
+    cmd_with_home(tmp.path())
+        .env("TOKSCALE_API_TOKEN", "test-token")
+        .args(["--no-spinner", "autosubmit", "run", "--force"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Scanning local session data ("))
+        .stdout(predicate::str::is_match(r"Scanned in \d+\.\d+s\.").unwrap())
+        .stdout(predicate::str::contains("Tip:").not())
+        .stdout(predicate::str::contains("No usage data found to submit."));
+}
+
+/// Every command `cmd_with_home` builds must resolve the API to a dead loopback
+/// port instead of production.
+///
+/// `auth::get_api_base_url` reads `TOKSCALE_API_URL` and falls back to
+/// `https://tokscale.ai`, and `submit`, `autosubmit run`, `login` and
+/// `delete-submitted-data` all format their endpoint onto whatever it returns.
+/// Before the pin the harness neither set nor removed that variable, so a
+/// non-dry-run submit under a fixture with usage sent
+/// `POST https://tokscale.ai/api/submit` carrying the test's bearer token, with
+/// only the loopback proxies stopping it, and a developer with
+/// `TOKSCALE_API_URL` exported silently redirected every test to their own
+/// server.
+///
+/// `login --token` is the cheapest command that reaches the API with no fixture
+/// at all: the `tt_` prefix check passes locally, then it GETs
+/// `{api}/api/auth/token` and prints the request URL when the connection fails.
+/// Asserting on that URL proves the child process resolved the pinned base,
+/// which reading the env map back off the `Command` would not.
+#[test]
+fn test_cmd_with_home_keeps_api_calls_off_production() {
+    let tmp = TempDir::new().expect("failed to create temp dir");
+
+    cmd_with_home(tmp.path())
+        .args(["--no-spinner", "login", "--token", "tt_not_a_real_token"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "url (http://127.0.0.1:9/api/auth/token)",
+        ))
+        .stderr(predicate::str::contains("tokscale.ai").not());
 }
 
 #[test]
