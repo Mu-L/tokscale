@@ -5882,7 +5882,34 @@ fn report_excluded_tokenless_rows(excluded: &[ExcludedTokenlessRow]) {
 fn report_unpriced_submission_usage(unpriced: &[tokscale_core::UnpricedSubmissionUsage]) {
     use colored::Colorize;
 
-    for row in unpriced {
+    if unpriced.is_empty() {
+        return;
+    }
+
+    // A long proxy-model history fans out to one row per provider/model pair
+    // (dozens in practice), burying the submittable summary. Cap the per-row
+    // detail exactly like `report_excluded_tokenless_rows` and report the
+    // aggregate instead. This print is the only place the rows surface at all:
+    // `GraphResult::unpriced_submission_usage` is `#[serde(skip)]` and never
+    // reaches a payload, and `--dry-run` runs this same reporter — so the
+    // capped rows are still named by id below rather than dropped.
+    const MAX_DETAIL_ROWS: usize = 20;
+
+    // Core keys these rows by `(provider, model)`, which hands the cap the
+    // alphabetically first rows rather than the ones worth pricing. The hint
+    // below asks the user to price the ids printed here, so rank by what
+    // pricing them recovers: tokens first (every row is $0.00 by definition,
+    // so cost cannot rank them), then message count, with the provider/model
+    // key as the tiebreak to keep the output deterministic.
+    let mut ranked: Vec<&tokscale_core::UnpricedSubmissionUsage> = unpriced.iter().collect();
+    ranked.sort_by(|a, b| {
+        b.total_tokens
+            .cmp(&a.total_tokens)
+            .then_with(|| b.message_count.cmp(&a.message_count))
+            .then_with(|| (&a.provider_id, &a.model_id).cmp(&(&b.provider_id, &b.model_id)))
+    });
+
+    for row in ranked.iter().take(MAX_DETAIL_ROWS) {
         println!(
             "{}",
             format!(
@@ -5897,22 +5924,59 @@ fn report_unpriced_submission_usage(unpriced: &[tokscale_core::UnpricedSubmissio
         );
     }
 
+    // Name the capped rows even though their prose is dropped: the hint tells
+    // the user to add pricing keyed by the ids printed above, so an id that
+    // never prints is an unfixable gap. Wrapped a few per line rather than
+    // truncated -- dropping an id makes it unfixable, whereas one long line is
+    // only unreadable, and a 45-row history put every id on that one line.
+    if ranked.len() > MAX_DETAIL_ROWS {
+        const TAIL_IDS_PER_LINE: usize = 4;
+        let capped = &ranked[MAX_DETAIL_ROWS..];
+        println!(
+            "{}",
+            format!("    ... and {} more at $0.00:", capped.len()).bright_black()
+        );
+        for chunk in capped.chunks(TAIL_IDS_PER_LINE) {
+            let ids = chunk
+                .iter()
+                .map(|row| format!("{}/{}", row.provider_id, row.model_id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("{}", format!("      {}", ids).bright_black());
+        }
+    }
+
+    let total_messages: usize = unpriced
+        .iter()
+        .fold(0usize, |acc, row| acc.saturating_add(row.message_count));
+    let total_tokens: i64 = unpriced
+        .iter()
+        .fold(0i64, |acc, row| acc.saturating_add(row.total_tokens));
+    println!(
+        "{}",
+        format!(
+            "  Unpriced total: {} message(s) ({} tokens) at $0.00 across {} provider/model(s).",
+            total_messages,
+            format_tokens_with_commas(total_tokens),
+            unpriced.len(),
+        )
+        .bright_black()
+    );
+
     // Homebrew-style follow-up: the warnings above name the gap, but nothing
     // told the user the fix is one file away. #1021/#1035 reporters (and the
     // custom-pricing docs added after them) all had to read core sources to
     // discover that an exact-match entry in custom-pricing.json — including
     // explicit 0 rates for free models and routing labels — is the supported fix.
-    if !unpriced.is_empty() {
-        let pricing_path = crate::paths::get_config_dir().join("custom-pricing.json");
-        println!(
-            "{}",
-            format!(
-                "  Hint: unpriced usage is included in token totals with zero cost. Add exact-match entries to\n          {}\n          keyed by the model id alone (the `model` half of the `provider/model` above),\n          where an explicit 0 declares a free model or a known routing-label rate. Re-check\n          with `tokscale submit --dry-run` and `tokscale pricing <model-id>`, then resubmit\n          to replace the temporary cost floor with a complete total.",
-                pricing_path.display(),
-            )
-            .bright_black()
-        );
-    }
+    let pricing_path = crate::paths::get_config_dir().join("custom-pricing.json");
+    println!(
+        "{}",
+        format!(
+            "  Hint: unpriced usage is included in token totals with zero cost. Add exact-match entries to\n          {}\n          keyed by the model id alone (the `model` half of the `provider/model` above),\n          where an explicit 0 declares a free model or a known routing-label rate. Re-check\n          with `tokscale submit --dry-run` and `tokscale pricing <model-id>`, then resubmit\n          to replace the temporary cost floor with a complete total.",
+            pricing_path.display(),
+        )
+        .bright_black()
+    );
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
