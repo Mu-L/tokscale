@@ -59,6 +59,34 @@ export interface CandidateRow {
    * condition as a subtraction.
    */
   slopTokens: number | null;
+  /**
+   * The completeness gate's own clause values, re-exported from the
+   * candidates query so the unknowable-reason classification
+   * (aggregateUnknowableStats) reports the gate's actual inputs rather than
+   * re-deriving them. Only meaningful on rows with a slop model match — the
+   * attribution CTEs are scoped to those in SQL; the values below are the
+   * NULL-coalesced defaults anywhere else and must not be read as a verdict
+   * for non-slop accounts.
+   */
+  hasOverNestedEntry: boolean;
+  everyDayAttributed: boolean;
+  /**
+   * Tokens the daily rows attribute to SOME named model — the gate's left
+   * operand, held as bigint because PostgreSQL decides the gate over
+   * numeric/bigint and production totals exceed Number.MAX_SAFE_INTEGER. A
+   * one-token shortfall above 2^53 rounds into apparent equality as a Number,
+   * which would misclassify the failure as `unknown` and zero the measured
+   * gap.
+   */
+  attributedTokens: bigint;
+  /**
+   * The gate's right operand (`submissions.total_tokens`) at full precision.
+   * `totalTokens` above is the same value as a Number for scoring ratios and
+   * the UI, where a few units of drift at 10^15 cannot move a threshold;
+   * every comparison or subtraction against `attributedTokens` must use this
+   * field instead.
+   */
+  totalTokensExact: bigint;
 }
 
 export interface CandidateContext {
@@ -81,9 +109,178 @@ export interface CandidateSignal {
   weight: number;
 }
 
-export interface ScoredCandidate extends CandidateRow {
+/**
+ * The bigint gate operands are stripped rather than inherited: a scored
+ * candidate is what the admin route serializes with NextResponse.json, and
+ * JSON.stringify throws on bigint. They exist for the unknowable-reason
+ * classification and telemetry, which consume CandidateRow directly.
+ */
+export interface ScoredCandidate
+  extends Omit<CandidateRow, "attributedTokens" | "totalTokensExact"> {
   score: number;
   signals: CandidateSignal[];
+}
+
+/**
+ * Why a slop-matched candidate's token attribution came back unknowable
+ * (`slopTokens === null`). Exists for observability, not scoring: the
+ * fail-closed decision lives in the candidates query's completeness gate, and
+ * this classification re-derives which clause of that gate failed so an
+ * operator can tell how often the fail-closed path fires and why.
+ */
+export type UnknowableReason =
+  /**
+   * At least one daily_breakdown row carries no source_breakdown at all
+   * (legacy pre-breakdown shape). every_day_attributed failed.
+   */
+  | "missing_breakdown"
+  /**
+   * At least one client entry's per-model map sums past the entry's own
+   * scalar, so the entry contradicts itself (over_nested). This dominates the
+   * other classes: a contradictory entry is never repaired by better
+   * arithmetic elsewhere in the same submission.
+   */
+  | "over_nested"
+  /**
+   * Every row has a breakdown and no entry contradicts itself, but the
+   * attributed sum still falls short of the stored total: a scalar remainder
+   * no modelId claims, or tokens parked under a key that names nothing
+   * (unknown / parser debris). attributed_tokens < total_tokens.
+   */
+  | "unattributed_tokens"
+  /**
+   * The completeness gate failed but none of the three known clauses can be
+   * the cause — the SQL drifted ahead of this classifier. Distinct so a
+   * drifted gate surfaces as its own bucket in the telemetry instead of being
+   * misattributed to one of the measured classes.
+   */
+  | "unknown";
+
+/**
+ * One invocation's breadth measurement: how many slop-matched candidates the
+ * fail-closed path swallowed, by reason, and the share of those candidates'
+ * tokens that no named model accounts for. Percentages are computed by the
+ * consumer (log pipeline, dashboard) over whatever window it aggregates.
+ */
+export interface UnknowableStats {
+  /** Candidates naming a slop model whose slopTokens could be computed. */
+  knowable: number;
+  /** Candidates naming a slop model whose slopTokens came back null. */
+  unknowable: number;
+  byReason: Record<UnknowableReason, number>;
+  /**
+   * Sum over unknowable candidates of GREATEST(total - attributed, 0) — the
+   * tokens no named model accounts for. The clamp is defence against the
+   * attributed sum overshooting the stored total on drifted data; on
+   * well-formed rows the gate itself guarantees attributed < total. Held as
+   * bigint end-to-end: the operands are exact off the driver, and a Number
+   * detour would erase one-token gaps above 2^53.
+   */
+  unattributedTokens: bigint;
+  /** Sum of unknowable candidates' stored totals, exact for the same reason. */
+  unknowableTotalTokens: bigint;
+  /**
+   * Log-scale histogram of per-candidate unattributed tokens over the
+   * unknowable set: key n counts candidates with at least
+   * 2**n * UNKNOWABLE_BUCKET_WIDTH unattributed tokens. The largest key is
+   * open-ended — a gap beyond it lands there rather than under a key the
+   * allocation never made. The flat
+   * unattributedTokens / unknowableTotalTokens pair cannot say whether the
+   * missing share is a rounding error or the whole submission — one account
+   * missing 99% and nine missing 1% aggregate identically — and whether it
+   * is one large account or many small ones decides whether the fail-closed
+   * path is a rare safety net or a routine outcome.
+   */
+  unattributedHistogram: Record<string, number>;
+}
+
+/** Bucket boundaries for the unattributed-tokens histogram. */
+const UNKNOWABLE_HISTOGRAM_BUCKETS = 8;
+
+/**
+ * Classifies one candidate's NULL slopTokens into the gate clause that
+ * produced it. Checked in dominance order: an over-nested entry makes the
+ * whole submission unknowable whatever else is true of it, and a missing
+ * breakdown makes the attributed sum unobservable rather than merely short.
+ */
+export function classifyUnknowableReason(row: CandidateRow): UnknowableReason {
+  if (row.hasOverNestedEntry) {
+    return "over_nested";
+  }
+  if (!row.everyDayAttributed) {
+    return "missing_breakdown";
+  }
+  if (row.attributedTokens < row.totalTokensExact) {
+    return "unattributed_tokens";
+  }
+  return "unknown";
+}
+
+/**
+ * Aggregates one getModerationCandidates() result into the fail-closed
+ * breadth measurement. Only candidates with at least one slop model name are
+ * counted at all: the attribution work is scoped to them in SQL, so a
+ * non-slop account says nothing about how often the path fires.
+ */
+export function aggregateUnknowableStats(
+  candidates: readonly CandidateRow[]
+): UnknowableStats {
+  const stats: UnknowableStats = {
+    knowable: 0,
+    unknowable: 0,
+    byReason: {
+      missing_breakdown: 0,
+      over_nested: 0,
+      unattributed_tokens: 0,
+      unknown: 0,
+    },
+    unattributedTokens: 0n,
+    unknowableTotalTokens: 0n,
+    unattributedHistogram: Object.fromEntries(
+      Array.from({ length: UNKNOWABLE_HISTOGRAM_BUCKETS }, (_, i) => [
+        String(2 ** i * UNKNOWABLE_BUCKET_WIDTH),
+        0,
+      ])
+    ),
+  };
+
+  for (const candidate of candidates) {
+    if (candidate.slopModels.length === 0) {
+      continue;
+    }
+    if (candidate.slopTokens !== null) {
+      stats.knowable += 1;
+      continue;
+    }
+    stats.unknowable += 1;
+    stats.byReason[classifyUnknowableReason(candidate)] += 1;
+    // bigint throughout: the gate operands are exact off the driver, and a
+    // Math.max/Math.min detour through Number would round a real one-token
+    // shortfall above 2^53 back into the zero gap this exists to measure.
+    const unattributed =
+      candidate.totalTokensExact > candidate.attributedTokens
+        ? candidate.totalTokensExact - candidate.attributedTokens
+        : 0n;
+    stats.unattributedTokens += unattributed;
+    stats.unknowableTotalTokens += candidate.totalTokensExact;
+    // Cap the walk at the largest allocated key: a gap past it still counts
+    // in every bucket up to and including the top one, instead of minting a
+    // key the allocation above never made — `undefined + 1` is NaN, which
+    // JSON.stringify then serializes as null, corrupting the telemetry on
+    // exactly the largest accounts. Boundaries are small exact integers, so
+    // lifting one into BigInt for the comparison loses nothing.
+    const maxBoundary =
+      2 ** (UNKNOWABLE_HISTOGRAM_BUCKETS - 1) * UNKNOWABLE_BUCKET_WIDTH;
+    for (
+      let boundary = UNKNOWABLE_BUCKET_WIDTH;
+      boundary <= maxBoundary && BigInt(boundary) <= unattributed;
+      boundary *= 2
+    ) {
+      stats.unattributedHistogram[String(boundary)] += 1;
+    }
+  }
+
+  return stats;
 }
 
 /**
@@ -175,6 +372,29 @@ export const SLOP_MODEL_REGEX = `(^|[^a-z0-9])(${SLOP_MODEL_PATTERNS.join("|")})
  * would pin accounts at full weight on a guess.
  */
 export const UNNAMED_MODEL_REGEX = `^([^a-zA-Z0-9]*|unknown)$`;
+
+/**
+ * Width of one measurement bucket for the unknowable-breadth telemetry, in
+ * tokens. Each bucket boundary is 2**n * UNKNOWABLE_BUCKET_WIDTH, so bucket
+ * n reads as "[2**n * width, 2**(n+1) * width) tokens unattributed". Fixed by
+ * the emitted log schema: widening it re-baselines every aggregate built on
+ * the bucket keys, so it is a constant, not a config knob.
+ */
+export const UNKNOWABLE_BUCKET_WIDTH = 1_000_000;
+
+/**
+ * The single structured-log event name the fail-closed breadth telemetry is
+ * emitted under. One line per getModerationCandidates() invocation,
+ * unconditionally: a window where every slop-matched candidate was knowable
+ * still contributes its denominator (knowable > 0, unknowable = 0) instead of
+ * silence, so the rate is derivable rather than only its failures. The JSON
+ * payload carries the counts, per-reason breakdown, and unattributed-token
+ * histogram; the two token sums travel as decimal strings because they are
+ * exact bigints and JSON.stringify refuses a bigint outright. Operators
+ * aggregate by `event` over any log window to answer "what fraction of
+ * submissions went unknowable in window W".
+ */
+export const UNKNOWABLE_EVENT = "moderation_unknowable_submissions";
 
 /** A user holding more than this share of all tokens is worth a look. */
 export const SITE_SHARE_THRESHOLD = 0.05;
@@ -314,8 +534,15 @@ export function scoreCandidate(
     }
   }
 
+  // Strip the bigint gate operands before the spread (see ScoredCandidate):
+  // NextResponse.json would otherwise throw on the first candidate row.
+  const {
+    attributedTokens: _attributedTokens,
+    totalTokensExact: _totalTokensExact,
+    ...serializable
+  } = row;
   return {
-    ...row,
+    ...serializable,
     score: signals.reduce((sum, signal) => sum + signal.weight, 0),
     signals,
   };

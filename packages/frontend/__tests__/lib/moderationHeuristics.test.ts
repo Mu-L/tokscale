@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import {
   SLOP_MODEL_REGEX,
+  UNKNOWABLE_BUCKET_WIDTH,
+  aggregateUnknowableStats,
+  classifyUnknowableReason,
   rankCandidates,
   scoreCandidate,
   type CandidateContext,
@@ -42,6 +45,14 @@ function row(overrides: Partial<CandidateRow> = {}): CandidateRow {
         : slopModels.length > 0
         ? totalTokens
         : 0,
+    // Gate-clause defaults for a fully attributed row; unknowable fixtures
+    // override at least one of the three. The bigint operands default to the
+    // Number total, which is exact for every fixture that does not opt into
+    // an explicit above-2^53 override.
+    hasOverNestedEntry: false,
+    everyDayAttributed: true,
+    attributedTokens: overrides.attributedTokens ?? BigInt(totalTokens),
+    totalTokensExact: overrides.totalTokensExact ?? BigInt(totalTokens),
     ...overrides,
   };
 }
@@ -368,5 +379,204 @@ describe("SLOP_MODEL_REGEX", () => {
     expect(matches("claude-sonnet-4-5")).toBe(false);
     expect(matches("deepseek-v3")).toBe(false);
     expect(matches("gpt-5.4")).toBe(false);
+  });
+});
+
+describe("classifyUnknowableReason", () => {
+  it("classifies an over-nested entry before anything else", () => {
+    // All three gate clauses fail at once here; the contradiction dominates
+    // because better arithmetic elsewhere in the submission cannot repair it.
+    const candidate = row({
+      slopModels: ["fake-api"],
+      slopTokens: null,
+      hasOverNestedEntry: true,
+      everyDayAttributed: false,
+      attributedTokens: 0n,
+    });
+
+    expect(classifyUnknowableReason(candidate)).toBe("over_nested");
+  });
+
+  it("classifies a missing daily breakdown next", () => {
+    const candidate = row({
+      slopModels: ["fake-api"],
+      slopTokens: null,
+      everyDayAttributed: false,
+      attributedTokens: 2n,
+    });
+
+    expect(classifyUnknowableReason(candidate)).toBe("missing_breakdown");
+  });
+
+  it("classifies an attributed-sum shortfall as unattributed tokens", () => {
+    const candidate = row({
+      slopModels: ["fake-api"],
+      slopTokens: null,
+      attributedTokens: 1_199_000n,
+    });
+
+    expect(classifyUnknowableReason(candidate)).toBe("unattributed_tokens");
+  });
+
+  it("flags a gate failure no known clause explains as drift", () => {
+    // everyDayAttributed, no over-nesting, attributed >= total — yet
+    // slopTokens came back null. That combination means the SQL gate drifted
+    // ahead of this classifier, and it must surface as its own bucket rather
+    // than being counted under one of the measured classes.
+    const candidate = row({
+      slopModels: ["fake-api"],
+      slopTokens: null,
+    });
+
+    expect(classifyUnknowableReason(candidate)).toBe("unknown");
+  });
+});
+
+describe("aggregateUnknowableStats", () => {
+  it("counts nothing when no candidate names a slop model", () => {
+    // slopTokens is meaningless off the slop-matched set — the attribution
+    // CTEs never run there — so these rows must not move any counter even if
+    // a fixture hands them a null.
+    const stats = aggregateUnknowableStats([
+      row({ slopModels: [], slopTokens: null, attributedTokens: 0n }),
+      row({ slopModels: [] }),
+    ]);
+
+    expect(stats.knowable).toBe(0);
+    expect(stats.unknowable).toBe(0);
+    expect(stats.unattributedTokens).toBe(0n);
+  });
+
+  it("separates knowable from unknowable slop-matched candidates", () => {
+    const stats = aggregateUnknowableStats([
+      row({ username: "knowable", slopModels: ["fake-api"], slopTokens: 2 }),
+      row({
+        username: "unknowable",
+        slopModels: ["fake-api"],
+        slopTokens: null,
+        attributedTokens: 1_199_000n,
+      }),
+    ]);
+
+    expect(stats.knowable).toBe(1);
+    expect(stats.unknowable).toBe(1);
+    expect(stats.byReason.unattributed_tokens).toBe(1);
+    expect(stats.unattributedTokens).toBe(1_000n);
+    expect(stats.unknowableTotalTokens).toBe(1_200_000n);
+  });
+
+  it("sweeps unattributed tokens into the log-scale histogram", () => {
+    // One candidate missing the whole 64,000,000-token total and nine
+    // missing under one bucket width aggregate to the same flat sums as one
+    // missing ~64M and nine missing ~1 each is NOT: the histogram is what
+    // tells "one large account" apart from "many small ones".
+    const largeGap = row({
+      username: "large-gap",
+      slopModels: ["fake-api"],
+      slopTokens: null,
+      totalTokens: 64 * UNKNOWABLE_BUCKET_WIDTH,
+      attributedTokens: 0n,
+    });
+    const smallGaps = Array.from({ length: 9 }, (_, i) =>
+      row({
+        username: `small-gap-${i}`,
+        slopModels: ["fake-api"],
+        slopTokens: null,
+        attributedTokens: BigInt(1_200_000 - 1),
+      })
+    );
+
+    const stats = aggregateUnknowableStats([largeGap, ...smallGaps]);
+
+    expect(stats.unknowable).toBe(10);
+    // The 64M gap crosses every boundary up to and including 64M; each small
+    // gap crosses none.
+    // Keyed by the numeric boundary so a width change re-baselines the
+    // expected keys instead of silently still passing on stale literals.
+    expect(stats.unattributedHistogram).toEqual(
+      Object.fromEntries(
+        [1, 2, 4, 8, 16, 32, 64, 128].map((power) => [
+          String(power * UNKNOWABLE_BUCKET_WIDTH),
+          power <= 64 ? 1 : 0,
+        ])
+      )
+    );
+    expect(stats.unattributedTokens).toBe(BigInt(64 * UNKNOWABLE_BUCKET_WIDTH + 9));
+  });
+
+  it("lands a gap past the largest boundary in the top bucket, not on a missing key", () => {
+    // 256M unattributed walks past the largest allocated key (128M). Without
+    // the cap the loop does `undefined + 1` on the never-allocated 256M key,
+    // and the resulting NaN serializes as null — corrupting the emitted
+    // telemetry on exactly the accounts whose gaps matter most.
+    const stats = aggregateUnknowableStats([
+      row({
+        slopModels: ["fake-api"],
+        slopTokens: null,
+        totalTokens: 256 * UNKNOWABLE_BUCKET_WIDTH,
+        attributedTokens: 0n,
+      }),
+    ]);
+
+    // Cumulative semantics hold all the way up: the gap crosses every
+    // boundary including the open-ended top one, and no extra key appears.
+    expect(stats.unattributedHistogram).toEqual(
+      Object.fromEntries(
+        [1, 2, 4, 8, 16, 32, 64, 128].map((power) => [
+          String(power * UNKNOWABLE_BUCKET_WIDTH),
+          1,
+        ])
+      )
+    );
+    // What the log line actually carries: every bucket a real number, never
+    // the null that JSON.stringify makes of NaN.
+    expect(JSON.stringify(stats.unattributedHistogram)).not.toContain("null");
+  });
+
+  it("clamps a negative gap rather than dragging the sum below zero", () => {
+    // Defence against drifted data: the gate guarantees attributed < total
+    // on well-formed rows, but a future drift that overshoots must not make
+    // the breadth metric go negative and hide the rest of the window.
+    const stats = aggregateUnknowableStats([
+      row({
+        slopModels: ["fake-api"],
+        slopTokens: null,
+        totalTokens: 100,
+        attributedTokens: 200n,
+        hasOverNestedEntry: true,
+      }),
+    ]);
+
+    expect(stats.unattributedTokens).toBe(0n);
+    expect(stats.byReason.over_nested).toBe(1);
+  });
+
+  it("keeps a one-token gate shortfall above 2^53 exact", () => {
+    // SQL-exact regression: PostgreSQL correctly fails
+    // `attributed_tokens >= total_tokens` at
+    // 9007199254740995 < 9007199254740996, yet BOTH operands round to the
+    // same Number (9007199254740996). A Number pipeline classifies that row
+    // as `unknown` and measures a zero gap; the bigint operands must carry
+    // the real clause and the true one-token shortfall through to the stats.
+    const candidate = row({
+      slopModels: ["fake-api"],
+      slopTokens: null,
+      totalTokens: 9_007_199_254_740_996,
+      totalTokensExact: 9_007_199_254_740_996n,
+      attributedTokens: 9_007_199_254_740_995n,
+    });
+
+    // The collapse being guarded against: as Numbers the operands are equal.
+    expect(Number(candidate.attributedTokens)).toBe(
+      Number(candidate.totalTokensExact)
+    );
+
+    expect(classifyUnknowableReason(candidate)).toBe("unattributed_tokens");
+
+    const stats = aggregateUnknowableStats([candidate]);
+    expect(stats.byReason.unattributed_tokens).toBe(1);
+    expect(stats.byReason.unknown).toBe(0);
+    expect(stats.unattributedTokens).toBe(1n);
+    expect(stats.unknowableTotalTokens).toBe(9_007_199_254_740_996n);
   });
 });

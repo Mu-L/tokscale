@@ -6,6 +6,8 @@ import {
   MEDIAN_RATIO_THRESHOLD,
   SLOP_MODEL_REGEX,
   UNNAMED_MODEL_REGEX,
+  UNKNOWABLE_EVENT,
+  aggregateUnknowableStats,
   rankCandidates,
   SITE_SHARE_THRESHOLD,
   type CandidateRow,
@@ -32,6 +34,9 @@ interface CandidateDbRow extends Record<string, unknown> {
   near_duplicate_count: number | string | null;
   slop_models: string[] | null;
   slop_tokens: number | string | null;
+  has_over_nested_entry: boolean | null;
+  every_day_attributed: boolean | null;
+  attributed_tokens: number | string | null;
   site_tokens: number | string | null;
   median_tokens: number | string | null;
 }
@@ -45,6 +50,27 @@ interface CandidateDbRow extends Record<string, unknown> {
 function toNumber(value: number | string | null | undefined): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/**
+ * Exact counterpart of toNumber() for the completeness gate's own operands.
+ * The gate compares SUM(numeric) >= bigint in SQL, and above 2^53 a Number
+ * round-trip collapses a real one-token shortfall into apparent equality —
+ * classifyUnknowableReason() would then report `unknown` and the measured gap
+ * would be zero, on exactly the totals large enough to matter. postgres-js
+ * hands both column types over as decimal strings; keep the integral part
+ * digit-for-digit and never round. Garbage degrades to 0n the way toNumber()
+ * degrades to 0, so a driver surprise cannot throw the whole queue away.
+ */
+function toBigInt(value: number | string | null | undefined): bigint {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? BigInt(Math.trunc(value)) : 0n;
+  }
+  if (typeof value === "string") {
+    const integral = /^-?\d+/.exec(value.trim());
+    return integral ? BigInt(integral[0]) : 0n;
+  }
+  return 0n;
 }
 
 /**
@@ -280,6 +306,19 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
           THEN COALESCE(su.slop_tokens, 0)
           ELSE NULL
         END AS slop_tokens,
+        -- Observability for the fail-closed completeness gate above, NOT
+        -- inputs to the decision: they re-export the gate's own clause values
+        -- verbatim so the application can report which clause failed without
+        -- re-deriving it. Projected through these existing joins rather than
+        -- read back by correlated subqueries in the outer SELECT — a second
+        -- reference to a CTE makes PostgreSQL materialize it, and the
+        -- correlated lookup then rescans the unindexed tuplestore once per
+        -- eligible row. The attribution CTEs are scoped to submissions with a
+        -- slop model match, so these come back NULL anywhere else and must
+        -- not be read as a verdict for non-slop accounts.
+        su.has_over_nested_entry AS has_over_nested_entry,
+        dl.every_day_attributed AS every_day_attributed,
+        su.attributed_tokens AS attributed_tokens,
         CASE WHEN p.total_tokens > 0 THEN
           COUNT(*) OVER (
             ORDER BY p.total_tokens
@@ -311,15 +350,13 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
     SELECT
       user_id, username, avatar_url, leaderboard_hidden, total_tokens,
       total_cost, submit_count, has_backfill, daily_tokens,
-      near_duplicate_count, slop_models, slop_tokens, site_tokens, median_tokens
+      near_duplicate_count, slop_models, slop_tokens,
+      has_over_nested_entry, every_day_attributed, attributed_tokens,
+      site_tokens, median_tokens
     FROM eligible
   `);
 
   const dbRows = (result as unknown as CandidateDbRow[]) ?? [];
-
-  if (dbRows.length === 0) {
-    return [];
-  }
 
   const rows: CandidateRow[] = dbRows.map((row) => ({
     userId: row.user_id,
@@ -334,7 +371,39 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
     nearDuplicateCount: toNumber(row.near_duplicate_count),
     slopModels: Array.isArray(row.slop_models) ? row.slop_models : [],
     slopTokens: row.slop_tokens == null ? null : toNumber(row.slop_tokens),
+    hasOverNestedEntry: row.has_over_nested_entry === true,
+    everyDayAttributed: row.every_day_attributed === true,
+    attributedTokens: toBigInt(row.attributed_tokens),
+    totalTokensExact: toBigInt(row.total_tokens),
   }));
+
+  const stats = aggregateUnknowableStats(rows);
+  // One structured line per invocation, unconditionally. This is the
+  // telemetry the breadth question is answered from: aggregate by event over
+  // any log window to get the fraction of slop-matched submissions that were
+  // unknowable, broken down by which gate clause failed and how many of their
+  // tokens no named model accounts for. The line must also fire when nothing
+  // was unknowable — the rate is a fraction, and a fully-knowable window has
+  // to contribute its denominator; emitting only failures cannot distinguish
+  // "nothing failed" from "nothing was measured".
+  console.warn(
+    `[moderation] ${JSON.stringify({
+      event: UNKNOWABLE_EVENT,
+      knowable: stats.knowable,
+      unknowable: stats.unknowable,
+      byReason: stats.byReason,
+      // Decimal strings, not numbers: JSON.stringify throws on a bigint, and
+      // a Number here would round away exactly the sub-2^53 precision the
+      // bigint pipeline exists to keep.
+      unattributedTokens: stats.unattributedTokens.toString(),
+      unknowableTotalTokens: stats.unknowableTotalTokens.toString(),
+      unattributedHistogram: stats.unattributedHistogram,
+    })}`
+  );
+
+  if (dbRows.length === 0) {
+    return [];
+  }
 
   return rankCandidates(rows, {
     siteTokens: toNumber(dbRows[0].site_tokens),
