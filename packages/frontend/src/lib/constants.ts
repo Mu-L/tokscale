@@ -83,6 +83,7 @@ export const SOURCE_DISPLAY_NAMES: Record<ClientType, string> = {
   unsloth: "Unsloth",
   hindsight: "Hindsight",
   "micode-desktop": "Xiaomi MiMo AI",
+  muse: "Muse Code",
 };
 
 // Client logos from GitHub CDN (public repo)
@@ -150,6 +151,7 @@ export const SOURCE_LOGOS: Record<ClientType, string> = {
   hindsight: `${GITHUB_CDN_BASE}/client-hindsight.png`,
   // Distinct desktop product icon (from Xiaomi MiMo AI.app Resources/icon.icns).
   "micode-desktop": `${GITHUB_CDN_BASE}/client-micode-desktop.png`,
+  muse: "https://github.com/meta-models.png",
 };
 
 export const SOURCE_COLORS: Record<ClientType, string> = {
@@ -209,6 +211,7 @@ export const SOURCE_COLORS: Record<ClientType, string> = {
   unsloth: "#58CC02",
   hindsight: "#0891B2",
   "micode-desktop": "#FF6900",
+  muse: "#0064E0",
 };
 
 // Derived values

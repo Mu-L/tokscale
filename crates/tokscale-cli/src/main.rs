@@ -1131,6 +1131,7 @@ pub enum ClientFilter {
     Hindsight,
     #[value(name = "micode-desktop")]
     MicodeDesktop,
+    Muse,
     Synthetic,
 }
 
@@ -1195,6 +1196,7 @@ impl ClientFilter {
             Self::Unsloth => "unsloth",
             Self::Hindsight => "hindsight",
             Self::MicodeDesktop => "micode-desktop",
+            Self::Muse => "muse",
             Self::Synthetic => "synthetic",
         }
     }
@@ -1262,6 +1264,7 @@ impl ClientFilter {
             Self::Unsloth => Some(ClientId::Unsloth),
             Self::Hindsight => Some(ClientId::Hindsight),
             Self::MicodeDesktop => Some(ClientId::MiMoDesktop),
+            Self::Muse => Some(ClientId::Muse),
             Self::Synthetic => None,
         }
     }
@@ -1325,6 +1328,7 @@ impl ClientFilter {
             ClientId::Unsloth => Self::Unsloth,
             ClientId::Hindsight => Self::Hindsight,
             ClientId::MiMoDesktop => Self::MicodeDesktop,
+            ClientId::Muse => Self::Muse,
         }
     }
 
@@ -8504,6 +8508,11 @@ mod tests {
     #[test]
     fn test_capitalize_client_jcode() {
         assert_eq!(capitalize_client("jcode"), "Jcode");
+    }
+
+    #[test]
+    fn test_capitalize_client_muse() {
+        assert_eq!(capitalize_client("muse"), "Muse Code");
     }
 
     #[test]

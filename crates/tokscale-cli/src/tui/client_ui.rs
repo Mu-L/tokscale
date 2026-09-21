@@ -69,6 +69,10 @@ pub const CLIENT_UI: [ClientUi; ClientId::COUNT] = [
     // Xiaomi MiMo AI desktop: uppercase 'W' stays free; lowercase letters for
     // "MiMo"/"desktop" are already taken by MiMo Code / Crush / Mux.
     ClientUi { hotkey: 'W' },
+    // Muse: both cases of `m` are taken (MiMo Code / Mcode), `u` belongs to
+    // Grok Build, `s` is the global "sources" picker binding and `e` belongs
+    // to Hermes, so `N` takes the next free letter.
+    ClientUi { hotkey: 'N' },
 ];
 
 pub fn display_name(client: ClientId) -> &'static str {
