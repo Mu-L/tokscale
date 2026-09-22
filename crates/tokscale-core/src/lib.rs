@@ -1705,6 +1705,75 @@ fn parse_all_messages_streaming<S: MessageSink>(
         )
     }
 
+    /// MiMo rows and exact provenance are one cache payload. A warm hit never
+    /// opens SQLite, and a cold read collects both in one reader snapshot.
+    fn load_or_parse_micode_source(
+        path: &Path,
+        source_cache: &message_cache::SourceMessageCache,
+    ) -> (
+        sessions::micode::MiMoSource,
+        Option<message_cache::CachedSourceEntry>,
+        bool,
+    ) {
+        let identity = message_cache::CacheIdentity::for_client(ClientId::MiMoCode);
+        let cached = source_cache.take(identity, path);
+        let before = match message_cache::SourceFingerprint::check_sqlite_path(
+            path,
+            cached.as_ref().map(|entry| &entry.fingerprint),
+        ) {
+            Some(message_cache::FingerprintStatus::Unchanged) => {
+                cached.as_ref().map(|entry| entry.fingerprint.clone())
+            }
+            Some(message_cache::FingerprintStatus::Changed(fingerprint)) => Some(fingerprint),
+            None => None,
+        };
+        if let Some(mut entry) = cached {
+            if before.as_ref() == Some(&entry.fingerprint)
+                && !entry.messages.is_empty()
+                && entry.has_valid_micode_metadata()
+            {
+                for message in &mut entry.messages {
+                    message.refresh_derived_fields();
+                }
+                return (
+                    sessions::micode::MiMoSource {
+                        messages: entry.messages,
+                        metadata: entry.micode_metadata.take().unwrap_or_default(),
+                        complete: true,
+                    },
+                    None,
+                    false,
+                );
+            }
+        }
+        let source = sessions::micode::parse_micode_source(path);
+        // A concurrent writer can commit after the read snapshot began. Never
+        // label that older pair with a newer database/WAL fingerprint.
+        let stable = before.as_ref().is_some_and(|fingerprint| {
+            matches!(
+                message_cache::SourceFingerprint::check_sqlite_path(path, Some(fingerprint)),
+                Some(message_cache::FingerprintStatus::Unchanged)
+            )
+        });
+        let cache_entry = if stable && source.complete && !source.messages.is_empty() {
+            before.map(|fingerprint| {
+                message_cache::CachedSourceEntry::new(
+                    identity,
+                    path,
+                    fingerprint,
+                    source.messages.clone(),
+                    Vec::new(),
+                    None,
+                )
+                .with_micode_metadata(source.metadata.clone())
+            })
+        } else {
+            None
+        };
+        let invalidate = !stable || !source.complete || source.messages.is_empty();
+        (source, cache_entry, invalidate)
+    }
+
     /// OpenCode's SQLite lane, where a warm scan reads only the rows that
     /// changed since the last one.
     ///
@@ -2045,62 +2114,30 @@ fn parse_all_messages_streaming<S: MessageSink>(
 
     // Parse MiMo Code: SQLite database(s)
     // OpenCode is the largest lane; release it before MiMo Code starts.
-    // `micode_indices` below stores indices into `all_messages`, so this must
-    // happen before the first one is recorded -- never inside that loop.
     flush_lane(&mut all_messages, &flush_context, sink);
 
-    let mut micode_indices: HashMap<(String, String), usize> = HashMap::new();
+    let mut micode_messages = sessions::micode::MiMoMessages::default();
 
     for db_path in &scan_result.micode_dbs {
-        // Pass `None` so the loader does not reprice: MiMo Code carries an
-        // authoritative per-message cost that unconditional repricing would
-        // overwrite (and persist to the cache). Reprice only messages that had
-        // no embedded cost, mirroring the gjc lane's guard.
-        let CachedParseOutcome {
-            messages,
-            cache_entry,
-            ..
-        } = load_or_parse_sqlite_source(
-            message_cache::CacheIdentity::for_client(ClientId::MiMoCode),
-            db_path,
-            &source_cache,
-            None,
-            sessions::micode::parse_micode_sqlite,
-        );
-
-        for mut message in messages {
-            if !message.has_authoritative_cost() {
-                apply_pricing_if_available(&mut message, pricing);
-            }
-            if let Some(key) = message.dedup_key.as_ref() {
-                // Key by (dedup_key, client): the same embedded message id can
-                // legitimately appear under both MiMo Code CLI and Xiaomi MiMo
-                // AI desktop when a session is forked across surfaces. Collapsing
-                // those would hide one surface's usage from its client filter.
-                // Channel-suffixed CLI databases share the same client stamp, so
-                // true CLI duplicates still collapse.
-                let index_key = (key.clone(), message.client.clone());
-                if let Some(index) = micode_indices.get(&index_key).copied() {
-                    if message.has_authoritative_cost()
-                        && !all_messages[index].has_authoritative_cost()
-                    {
-                        all_messages[index].cost = message.cost;
-                        all_messages[index].mark_provider_reported_cost();
-                    }
-                    continue;
-                }
-                micode_indices.insert(index_key, all_messages.len());
-            }
-            all_messages.push(message);
-        }
-
+        // Pricing happens only after raw source identities are reconciled.
+        let (source, cache_entry, invalidate) = load_or_parse_micode_source(db_path, &source_cache);
+        micode_messages.extend(db_path, source);
         if let Some(entry) = cache_entry {
             source_cache.insert(entry);
+        } else if invalidate {
+            source_cache.remove(
+                message_cache::CacheIdentity::for_client(ClientId::MiMoCode),
+                db_path,
+            );
         }
     }
 
-    // MiMo Code is done indexing into `all_messages`; release it.
-    flush_lane(&mut all_messages, &flush_context, sink);
+    // Buffer the whole shared store before choosing ownership: the original
+    // session can be in a database discovered after a fork's copied history.
+    for mut message in micode_messages.into_messages() {
+        apply_pricing_if_available(&mut message, pricing);
+        flush_message(message, &flush_context, sink);
+    }
 
     let claude_home = PathBuf::from(home_dir);
     let claude_outcomes: Vec<CachedParseOutcome> = scan_result
@@ -2355,7 +2392,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         sessions::cursor::parse_cursor_file,
     );
 
-    parse_cached_lane(
+    parse_cached_lane_deduped(
         &scan_result,
         &mut source_cache,
         pricing,
@@ -5297,13 +5334,14 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     // MiMo Code: SQLite database(s). Dedup by the payload's own message id the
     // same way the submit path does -- MiMo writes channel-suffixed databases,
     // so one session can appear in `mimocode.db` and `mimocode-<channel>.db`.
-    let mut micode_seen: HashSet<String> = HashSet::new();
-    let micode_msgs: Vec<ParsedMessage> = scan_result
-        .micode_dbs
+    let mut micode_messages = sessions::micode::MiMoMessages::default();
+    for db_path in &scan_result.micode_dbs {
+        micode_messages.extend(db_path, sessions::micode::parse_micode_source(db_path));
+    }
+    let micode_msgs: Vec<ParsedMessage> = micode_messages
+        .into_messages()
         .iter()
-        .flat_map(|db_path| sessions::micode::parse_micode_sqlite(db_path))
-        .filter(|msg| should_keep_deduped_message(&mut micode_seen, msg))
-        .map(|msg| unified_to_parsed(&msg))
+        .map(unified_to_parsed)
         .collect();
     let mut micode_count = 0i32;
     let mut micode_desktop_count = 0i32;
@@ -5969,10 +6007,15 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::Muse, muse_count);
     messages.extend(muse_msgs);
 
-    let mcode_msgs: Vec<ParsedMessage> = scan_result
+    let mcode_raw: Vec<UnifiedMessage> = scan_result
         .get(ClientId::Mcode)
         .par_iter()
         .flat_map(|path| sessions::mcode::parse_mcode_file(path))
+        .collect();
+    let mut mcode_seen = HashSet::new();
+    let mcode_msgs: Vec<ParsedMessage> = mcode_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut mcode_seen, message))
         .map(|message| unified_to_parsed(&message))
         .collect();
     let mcode_count = summed_parsed_message_count(&mcode_msgs);

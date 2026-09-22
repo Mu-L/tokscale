@@ -670,6 +670,13 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
                 // naturally rejects the `.db-wal`/`.db-shm`/`.db-journal`
                 // sidecars SQLite writes alongside the main file.
                 "*.db" => file_name.ends_with(".db"),
+                // A user-selected MiMo file may be a renamed shared store.
+                // Directory roots still discover only known engine filenames,
+                // never every unrelated SQLite database below that directory.
+                "micode-db" => {
+                    (e.depth() == 0 && path.extension().is_some_and(|ext| ext == "db"))
+                        || is_micode_db_filename(file_name)
+                }
                 _ => false,
             }
         })
@@ -1539,7 +1546,18 @@ fn push_unique_scan_task(
     client_id: ClientId,
     raw_path: impl Into<PathBuf>,
 ) {
-    push_unique_scan_task_with_pattern(tasks, seen, client_id, raw_path, client_id.data().pattern);
+    let raw_path = raw_path.into();
+    let pattern = if matches!(client_id, ClientId::MiMoCode | ClientId::MiMoDesktop) {
+        // Reject invalid explicit aliases before canonical-root dedup, or an
+        // alias.txt listed first could suppress a valid alias.db of the store.
+        if raw_path.is_file() && !raw_path.extension().is_some_and(|ext| ext == "db") {
+            return;
+        }
+        "micode-db"
+    } else {
+        client_id.data().pattern
+    };
+    push_unique_scan_task_with_pattern(tasks, seen, client_id, raw_path, pattern);
 }
 
 fn push_unique_scan_task_with_pattern(
@@ -1911,6 +1929,12 @@ fn scan_all_clients_with_env_strategy_inner(
     if enabled.contains(&ClientId::DevinDesktop) {
         enabled_with_lookups.insert(ClientId::DevinCli);
     }
+    // Either MiMo surface can own rows in a store configured for its sibling.
+    // Discover both sets of roots; the parse tail still applies the requested
+    // surface filter after shared-store deduplication.
+    if enabled.contains(&ClientId::MiMoCode) || enabled.contains(&ClientId::MiMoDesktop) {
+        enabled_with_lookups.extend([ClientId::MiMoCode, ClientId::MiMoDesktop]);
+    }
     // OpenClaw can run Codex app-server against the user's own Codex home
     // (`appServer.homeScope: "user"`), and the rollouts it leaves there are
     // OpenClaw's usage (their `session_meta.originator` names OpenClaw). Treat
@@ -2170,9 +2194,9 @@ fn scan_all_clients_with_env_strategy_inner(
     // `~/Library/Application Support/orca/mimocode-hooks/shared/data/`, and that
     // copy can hold sessions the XDG copy is missing (scanning only XDG then
     // undercounts). Scan both so the totals are the union; the cross-file dedup
-    // in the parse loop (keyed on the globally unique embedded message id)
-    // collapses any message present in both locations, so overlapping data is
-    // never double-counted.
+    // in the parse loop keys embedded identities independently of surface;
+    // cross-surface fork copies with regenerated ids additionally require
+    // session-chronology evidence before collapsing.
     //
     // Xiaomi MiMo AI (desktop) shares this engine store; either client id
     // discovering the DBs is enough for the micode parse lane, which re-stamps
@@ -2856,6 +2880,16 @@ fn scan_all_clients_with_env_strategy_inner(
             }
         }
     }
+    // Extra-root tasks distinguish explicitly selected files from recursively
+    // discovered engine filenames before this merge. Route both surfaces into
+    // the shared SQLite lane and deduplicate aliases against default/orca roots;
+    // filtering names again here would discard an explicitly renamed store.
+    let mut micode_dbs = std::mem::take(&mut result.micode_dbs);
+    for client in [ClientId::MiMoCode, ClientId::MiMoDesktop] {
+        micode_dbs.append(result.get_mut(client));
+    }
+    result.micode_dbs = dedup_dbs_by_canonical_path(micode_dbs);
+
     for file in dedupe_cherrystudio_transcripts(cherry_files) {
         let key = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
         if seen.insert((ClientId::CherryStudio, key)) {
