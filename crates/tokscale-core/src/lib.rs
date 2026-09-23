@@ -15,6 +15,7 @@ mod parser;
 pub mod paths;
 pub mod pricing;
 mod provider_identity;
+pub mod recovery;
 pub mod scanner;
 pub mod sessionize;
 pub mod sessions;
@@ -977,6 +978,13 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         scanner_settings,
         cache_policy,
         &mut messages,
+    );
+    let timezone = bucket_tz::BucketTimezone::from_scanner_settings(scanner_settings);
+    recovery::apply(
+        &mut messages,
+        home_dir,
+        clients,
+        timezone.is_pinned().then_some(&timezone),
     );
     messages
 }
@@ -4354,6 +4362,9 @@ fn aggregate_hourly_usage_entries(
     let mut hour_map: HashMap<String, HourAggregator> = HashMap::new();
 
     for msg in messages {
+        if recovery::is_daily(&msg) {
+            continue;
+        }
         let hour_key = if msg.timestamp > 0 {
             bucket_timezone
                 .hour_key(msg.timestamp)
@@ -4491,14 +4502,30 @@ async fn generate_graph_with_loaded_pricing(
     // applies the same date filters per message and drops each one after it
     // has landed in the day map and produced its session span.
     let mut sink = GraphSink::new(Some(&options), pricing, pricing_requirement);
-    parse_all_messages_streaming_with_env_strategy(
-        &home_dir,
-        &clients,
-        pricing,
-        options.use_env_roots,
-        &options.scanner_settings,
-        &mut sink,
-    );
+    if matches!(pricing_requirement, GraphPricingRequirement::Lenient)
+        && recovery::applicable(&home_dir)
+    {
+        // Local recovery requires native-session reconciliation. Submission
+        // always streams only the verifiable source messages.
+        for message in parse_all_messages_with_pricing_with_env_strategy(
+            &home_dir,
+            &clients,
+            pricing,
+            options.use_env_roots,
+            &options.scanner_settings,
+        ) {
+            sink.accept(message);
+        }
+    } else {
+        parse_all_messages_streaming_with_env_strategy(
+            &home_dir,
+            &clients,
+            pricing,
+            options.use_env_roots,
+            &options.scanner_settings,
+            &mut sink,
+        );
+    }
 
     sink.finish(start, &bucket_timezone)
 }
